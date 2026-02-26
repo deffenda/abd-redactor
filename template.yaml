@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: S3-triggered AI PDF redaction pipeline (Python Lambda + Amazon Comprehend).
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 120
+    MemorySize: 2048
+    Tracing: Active
+
+Parameters:
+  InputPrefix:
+    Type: String
+    Default: incoming/
+    Description: S3 key prefix that triggers redaction when a new PDF is uploaded.
+  OutputPrefix:
+    Type: String
+    Default: redacted/
+    Description: S3 key prefix where redacted PDFs are written.
+  MinEntityScore:
+    Type: Number
+    Default: 0.8
+    Description: Minimum confidence score from Comprehend (0.0 to 1.0).
+  ComprehendLanguage:
+    Type: String
+    Default: en
+    AllowedValues:
+      - en
+      - es
+    Description: Language for Comprehend PII detection.
+
+Resources:
+  PdfPipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  PdfRedactionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: app.lambda_handler
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref PdfPipelineBucket
+        - S3WritePolicy:
+            BucketName: !Ref PdfPipelineBucket
+        - Statement:
+            - Sid: AllowComprehendPIIDetection
+              Effect: Allow
+              Action:
+                - comprehend:DetectPiiEntities
+              Resource: "*"
+      Environment:
+        Variables:
+          INPUT_PREFIX: !Ref InputPrefix
+          OUTPUT_PREFIX: !Ref OutputPrefix
+          OUTPUT_BUCKET: !Ref PdfPipelineBucket
+          MIN_ENTITY_SCORE: !Ref MinEntityScore
+          COMPREHEND_LANGUAGE: !Ref ComprehendLanguage
+          LOG_LEVEL: INFO
+      Events:
+        NewPdfLowercaseInInputPrefix:
+          Type: S3
+          Properties:
+            Bucket: !Ref PdfPipelineBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref InputPrefix
+                  - Name: suffix
+                    Value: .pdf
+        NewPdfUppercaseInInputPrefix:
+          Type: S3
+          Properties:
+            Bucket: !Ref PdfPipelineBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: !Ref InputPrefix
+                  - Name: suffix
+                    Value: .PDF
+
+Outputs:
+  BucketName:
+    Description: Upload PDFs to this bucket under the input prefix.
+    Value: !Ref PdfPipelineBucket
+  InputPrefix:
+    Description: Upload trigger prefix.
+    Value: !Ref InputPrefix
+  OutputPrefix:
+    Description: Redacted PDF output prefix.
+    Value: !Ref OutputPrefix
+  LambdaFunctionName:
+    Description: Lambda function handling redaction.
+    Value: !Ref PdfRedactionFunction
