@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "abd-redactor"
+resolve_s3 = true
+s3_prefix = "abd-redactor"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "InputPrefix=\"incoming/\" OutputPrefix=\"redacted/\" MinEntityScore=\"0.8\" ComprehendLanguage=\"en\""
+image_repositories = []
+
+[default.global.parameters]
+region = "us-east-1"

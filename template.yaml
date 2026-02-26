@@ -29,20 +29,12 @@ Parameters:
       - en
       - es
     Description: Language for Comprehend PII detection.
+  ExistingBucketName:
+    Type: String
+    Default: ""
+    Description: Optional existing S3 bucket name to use for input/output. If empty, the template will not create a bucket and deployment requires this parameter.
 
 Resources:
-  PdfPipelineBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
 
   PdfRedactionFunction:
     Type: AWS::Serverless::Function
@@ -51,9 +43,9 @@ Resources:
       Handler: app.lambda_handler
       Policies:
         - S3ReadPolicy:
-            BucketName: !Ref PdfPipelineBucket
+            BucketName: !Ref ExistingBucketName
         - S3WritePolicy:
-            BucketName: !Ref PdfPipelineBucket
+            BucketName: !Ref ExistingBucketName
         - Statement:
             - Sid: AllowComprehendPIIDetection
               Effect: Allow
@@ -64,40 +56,26 @@ Resources:
         Variables:
           INPUT_PREFIX: !Ref InputPrefix
           OUTPUT_PREFIX: !Ref OutputPrefix
-          OUTPUT_BUCKET: !Ref PdfPipelineBucket
+          OUTPUT_BUCKET: !Ref ExistingBucketName
           MIN_ENTITY_SCORE: !Ref MinEntityScore
           COMPREHEND_LANGUAGE: !Ref ComprehendLanguage
           LOG_LEVEL: INFO
-      Events:
-        NewPdfLowercaseInInputPrefix:
-          Type: S3
-          Properties:
-            Bucket: !Ref PdfPipelineBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: !Ref InputPrefix
-                  - Name: suffix
-                    Value: .pdf
-        NewPdfUppercaseInInputPrefix:
-          Type: S3
-          Properties:
-            Bucket: !Ref PdfPipelineBucket
-            Events: s3:ObjectCreated:*
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: !Ref InputPrefix
-                  - Name: suffix
-                    Value: .PDF
+      # NOTE: S3 event notifications are intentionally omitted here to avoid
+      # a circular CloudFormation dependency between the S3 Bucket and the
+      # Lambda Permission resources that SAM creates for function events.
+      #
+      # Deployment options:
+      # - If you want SAM to wire S3 -> Lambda notifications automatically,
+      #   re-add an `Events` mapping here but be aware it can create a
+      #   circular dependency in certain templates. Alternatively,
+      # - Configure the S3 bucket notification after deployment (console,
+      #   CLI, or separate CloudFormation stack), or deploy the bucket
+      #   separately and pass its name via a parameter to this template.
 
 Outputs:
   BucketName:
-    Description: Upload PDFs to this bucket under the input prefix.
-    Value: !Ref PdfPipelineBucket
+    Description: S3 bucket name used for input/output. This must be created prior to deployment when `ExistingBucketName` parameter is provided.
+    Value: !Ref ExistingBucketName
   InputPrefix:
     Description: Upload trigger prefix.
     Value: !Ref InputPrefix

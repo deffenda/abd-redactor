@@ -19,7 +19,20 @@ comprehend_client = boto3.client("comprehend")
 INPUT_PREFIX = os.getenv("INPUT_PREFIX", "incoming/")
 OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "redacted/")
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "")
-MIN_ENTITY_SCORE = float(os.getenv("MIN_ENTITY_SCORE", "0.8"))
+def _env_float(name: str, default: float) -> float:
+    """Read an environment variable and parse it as float, returning
+    `default` when the variable is missing, empty, or invalid.
+    """
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        LOGGER.warning("Invalid float for %s: %r — using default %s", name, val, default)
+        return default
+
+MIN_ENTITY_SCORE = _env_float("MIN_ENTITY_SCORE", 0.8)
 COMPREHEND_LANGUAGE = os.getenv("COMPREHEND_LANGUAGE", "en")
 MAX_COMPREHEND_TEXT_LEN = int(os.getenv("MAX_COMPREHEND_TEXT_LEN", "4500"))
 
