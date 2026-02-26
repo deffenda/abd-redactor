@@ -1,0 +1,26 @@
+{
+  "version": "0",
+  "id": "7acde8da-bd29-4adf-82f9-bf6d4f76f309",
+  "detail-type": "Object Created",
+  "source": "aws.s3",
+  "account": "123456789012",
+  "time": "2026-02-26T00:00:00Z",
+  "region": "us-east-1",
+  "resources": [
+    "arn:aws:s3:::REPLACE_WITH_BUCKET_NAME"
+  ],
+  "detail": {
+    "version": "0",
+    "bucket": {
+      "name": "REPLACE_WITH_BUCKET_NAME"
+    },
+    "object": {
+      "key": "incoming/sample.pdf",
+      "size": 1024
+    },
+    "request-id": "REQ00000000000000000",
+    "requester": "123456789012",
+    "source-ip-address": "127.0.0.1",
+    "reason": "PutObject"
+  }
+}

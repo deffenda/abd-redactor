@@ -1,23 +1,33 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: S3-triggered AI PDF redaction pipeline (Python Lambda + Amazon Comprehend).
+Description: >-
+  Event-driven AWS pipeline to chunk large PDFs, batch-process PII detection
+  with Amazon Comprehend, and produce a fully redacted PDF plus redaction report.
 
 Globals:
   Function:
     Runtime: python3.12
-    Timeout: 120
-    MemorySize: 2048
     Tracing: Active
+    Architectures:
+      - x86_64
 
 Parameters:
   InputPrefix:
     Type: String
     Default: incoming/
-    Description: S3 key prefix that triggers redaction when a new PDF is uploaded.
+    Description: S3 key prefix where source PDFs are uploaded.
   OutputPrefix:
     Type: String
     Default: redacted/
     Description: S3 key prefix where redacted PDFs are written.
+  ReportPrefix:
+    Type: String
+    Default: reports/
+    Description: S3 key prefix where JSON redaction reports are written.
+  WorkPrefix:
+    Type: String
+    Default: work/
+    Description: S3 key prefix for intermediate manifests and batch findings.
   MinEntityScore:
     Type: Number
     Default: 0.8
@@ -28,60 +38,232 @@ Parameters:
     AllowedValues:
       - en
       - es
-    Description: Language for Comprehend PII detection.
-  ExistingBucketName:
-    Type: String
-    Default: ""
-    Description: Optional existing S3 bucket name to use for input/output. If empty, the template will not create a bucket and deployment requires this parameter.
+    Description: Language code used for Comprehend PII detection.
+  ChunkCharLimit:
+    Type: Number
+    Default: 4500
+    Description: Max characters per text chunk sent to Comprehend.
+  ChunksPerBatch:
+    Type: Number
+    Default: 20
+    Description: Number of chunks grouped into one batch file.
+  MapMaxConcurrency:
+    Type: Number
+    Default: 5
+    Description: Parallel batch-processing concurrency in Step Functions Map state.
 
 Resources:
+  PdfPipelineBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
 
-  PdfRedactionFunction:
+  PdfRedactionStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub "${AWS::StackName}-pdf-redaction"
+      Type: STANDARD
+      DefinitionSubstitutions:
+        PrepareChunksFunctionArn: !GetAtt PrepareChunksFunction.Arn
+        DetectBatchFunctionArn: !GetAtt DetectBatchFunction.Arn
+        AssembleOutputFunctionArn: !GetAtt AssembleOutputFunction.Arn
+      Definition:
+        Comment: Chunk large PDFs, detect PII in parallel batches, and build redacted outputs.
+        StartAt: PrepareChunks
+        States:
+          PrepareChunks:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${PrepareChunksFunctionArn}
+              Payload.$: $
+            OutputPath: $.Payload
+            Next: ProcessBatches
+          ProcessBatches:
+            Type: Map
+            ItemsPath: $.batch_manifest_keys
+            MaxConcurrencyPath: $.map_max_concurrency
+            ItemSelector:
+              job.$: $
+              batch_manifest_key.$: $$.Map.Item.Value
+            ItemProcessor:
+              ProcessorConfig:
+                Mode: INLINE
+              StartAt: DetectBatch
+              States:
+                DetectBatch:
+                  Type: Task
+                  Resource: arn:aws:states:::lambda:invoke
+                  Parameters:
+                    FunctionName: ${DetectBatchFunctionArn}
+                    Payload:
+                      job_id.$: $.job.job_id
+                      work_bucket.$: $.job.work_bucket
+                      work_prefix.$: $.job.work_prefix
+                      batch_manifest_key.$: $.batch_manifest_key
+                      min_entity_score.$: $.job.min_entity_score
+                      language_code.$: $.job.language_code
+                  OutputPath: $.Payload
+                  End: true
+            ResultPath: $.batch_results
+            Next: AssembleOutput
+          AssembleOutput:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${AssembleOutputFunctionArn}
+              Payload.$: $
+            OutputPath: $.Payload
+            End: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PrepareChunksFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DetectBatchFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AssembleOutputFunction
+
+  StartPipelineFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
-      Handler: app.lambda_handler
+      Handler: start_execution.lambda_handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref PdfRedactionStateMachine
+          INPUT_PREFIX: !Ref InputPrefix
+          OUTPUT_PREFIX: !Ref OutputPrefix
+          REPORT_PREFIX: !Ref ReportPrefix
+          WORK_PREFIX: !Ref WorkPrefix
+          OUTPUT_BUCKET: !Ref PdfPipelineBucket
+          MIN_ENTITY_SCORE: !Ref MinEntityScore
+          COMPREHEND_LANGUAGE: !Ref ComprehendLanguage
+          CHUNK_CHAR_LIMIT: !Ref ChunkCharLimit
+          CHUNKS_PER_BATCH: !Ref ChunksPerBatch
+          MAP_MAX_CONCURRENCY: !Ref MapMaxConcurrency
+          LOG_LEVEL: INFO
       Policies:
-        - S3ReadPolicy:
-            BucketName: !Ref ExistingBucketName
-        - S3WritePolicy:
-            BucketName: !Ref ExistingBucketName
+        - Statement:
+            - Sid: AllowStartStateMachine
+              Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource: !Ref PdfRedactionStateMachine
+
+  PrepareChunksFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: prepare_chunks.lambda_handler
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          WORK_PREFIX: !Ref WorkPrefix
+          CHUNK_CHAR_LIMIT: !Ref ChunkCharLimit
+          CHUNKS_PER_BATCH: !Ref ChunksPerBatch
+          LOG_LEVEL: INFO
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PdfPipelineBucket
+
+  DetectBatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: detect_pii_batch.lambda_handler
+      Timeout: 120
+      MemorySize: 1024
+      Environment:
+        Variables:
+          MIN_ENTITY_SCORE: !Ref MinEntityScore
+          COMPREHEND_LANGUAGE: !Ref ComprehendLanguage
+          LOG_LEVEL: INFO
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PdfPipelineBucket
         - Statement:
             - Sid: AllowComprehendPIIDetection
               Effect: Allow
               Action:
                 - comprehend:DetectPiiEntities
               Resource: "*"
+
+  AssembleOutputFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: assemble_output.lambda_handler
+      Timeout: 900
+      MemorySize: 3008
       Environment:
         Variables:
           INPUT_PREFIX: !Ref InputPrefix
           OUTPUT_PREFIX: !Ref OutputPrefix
-          OUTPUT_BUCKET: !Ref ExistingBucketName
-          MIN_ENTITY_SCORE: !Ref MinEntityScore
-          COMPREHEND_LANGUAGE: !Ref ComprehendLanguage
+          REPORT_PREFIX: !Ref ReportPrefix
+          WORK_PREFIX: !Ref WorkPrefix
           LOG_LEVEL: INFO
-      # NOTE: S3 event notifications are intentionally omitted here to avoid
-      # a circular CloudFormation dependency between the S3 Bucket and the
-      # Lambda Permission resources that SAM creates for function events.
-      #
-      # Deployment options:
-      # - If you want SAM to wire S3 -> Lambda notifications automatically,
-      #   re-add an `Events` mapping here but be aware it can create a
-      #   circular dependency in certain templates. Alternatively,
-      # - Configure the S3 bucket notification after deployment (console,
-      #   CLI, or separate CloudFormation stack), or deploy the bucket
-      #   separately and pass its name via a parameter to this template.
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PdfPipelineBucket
+
+  S3ObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Start redaction pipeline for new objects in the pipeline bucket.
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref PdfPipelineBucket
+      Targets:
+        - Arn: !GetAtt StartPipelineFunction.Arn
+          Id: StartPipelineTarget
+
+  AllowEventBridgeInvokeStartPipeline:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StartPipelineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3ObjectCreatedRule.Arn
 
 Outputs:
   BucketName:
-    Description: S3 bucket name used for input/output. This must be created prior to deployment when `ExistingBucketName` parameter is provided.
-    Value: !Ref ExistingBucketName
+    Description: S3 bucket for input PDFs, redacted outputs, and reports.
+    Value: !Ref PdfPipelineBucket
   InputPrefix:
     Description: Upload trigger prefix.
     Value: !Ref InputPrefix
   OutputPrefix:
     Description: Redacted PDF output prefix.
     Value: !Ref OutputPrefix
-  LambdaFunctionName:
-    Description: Lambda function handling redaction.
-    Value: !Ref PdfRedactionFunction
+  ReportPrefix:
+    Description: JSON report output prefix.
+    Value: !Ref ReportPrefix
+  WorkPrefix:
+    Description: Intermediate processing prefix.
+    Value: !Ref WorkPrefix
+  StateMachineArn:
+    Description: Step Functions state machine ARN.
+    Value: !Ref PdfRedactionStateMachine
+  StartFunctionName:
+    Description: Lambda that starts state machine executions.
+    Value: !Ref StartPipelineFunction
