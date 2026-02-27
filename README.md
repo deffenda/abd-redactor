@@ -96,7 +96,7 @@ Packaging note:
 - `src/requirements.txt` is intentionally minimal for Lambda artifact packaging.
 - Heavy shared dependencies are built into `SharedDependenciesLayer` from `layer/requirements.txt`.
 
-## AI Authorship Detection Bot (PDF + Word)
+## ADB Document Manager (AI Detection / Redaction / Summary)
 
 A lightweight upload API is available for:
 - AI authorship likelihood analysis
