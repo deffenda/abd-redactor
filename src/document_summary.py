@@ -45,6 +45,11 @@ def build_document_summary_filename(filename: str) -> str:
     return f"{source.stem}-document-summary.pdf"
 
 
+def build_document_summary_report_filename(filename: str) -> str:
+    source = Path(filename or "document")
+    return f"{source.stem}-document-summary-report.json"
+
+
 def _extract_json_payload(raw: str) -> dict[str, Any]:
     text = (raw or "").strip()
     if not text:
@@ -266,6 +271,35 @@ def generate_document_summary_file(
     model_name: str | None = None,
     additional_directions: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
+    payload, metrics = generate_document_summary_report(
+        input_path,
+        filename=filename,
+        model_name=model_name,
+        additional_directions=additional_directions,
+    )
+    summary_text = _render_document_summary_text(
+        payload,
+        source_filename=filename,
+        model_name=metrics.get("model_name_used", (model_name or DEFAULT_DOCUMENT_SUMMARY_MODEL)),
+        analyzed_chars=int(metrics.get("characters_analyzed", 0)),
+        original_chars=int(metrics.get("input_characters", 0)),
+        additional_directions=additional_directions,
+    )
+
+    output_fd, output_name = tempfile.mkstemp(suffix=".pdf")
+    os.close(output_fd)
+    output_path = Path(output_name)
+    _write_summary_text_to_pdf(summary_text, output_path)
+    return output_path, metrics
+
+
+def generate_document_summary_report(
+    input_path: Path,
+    *,
+    filename: str,
+    model_name: str | None = None,
+    additional_directions: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     suffix = Path(filename).suffix.lower()
     if suffix not in SUPPORTED_DOCUMENT_SUMMARY_EXTENSIONS:
         supported = ", ".join(sorted(SUPPORTED_DOCUMENT_SUMMARY_EXTENSIONS))
@@ -304,20 +338,6 @@ def generate_document_summary_file(
 
     payload = _merge_chunk_payloads(payloads)
 
-    summary_text = _render_document_summary_text(
-        payload,
-        source_filename=filename,
-        model_name=effective_model,
-        analyzed_chars=characters_analyzed,
-        original_chars=len(normalized),
-        additional_directions=directions or None,
-    )
-
-    output_fd, output_name = tempfile.mkstemp(suffix=".pdf")
-    os.close(output_fd)
-    output_path = Path(output_name)
-    _write_summary_text_to_pdf(summary_text, output_path)
-
     metrics = {
         "model_name_used": effective_model,
         "input_characters": len(normalized),
@@ -330,4 +350,17 @@ def generate_document_summary_file(
         "additional_directions_provided": bool(directions),
         "additional_directions_length": len(directions),
     }
-    return output_path, metrics
+    report_payload = {
+        "source_filename": filename,
+        "summary": payload.get("summary", ""),
+        "key_points": payload.get("key_points", []),
+        "action_items": payload.get("action_items", []),
+        "relevant_details": payload.get("relevant_details", []),
+        "unanswered_questions": payload.get("unanswered_questions", []),
+        "disclaimer": payload.get(
+            "disclaimer",
+            "AI-generated summary for review support only. Verify against the original document.",
+        ),
+        "metrics": metrics,
+    }
+    return report_payload, metrics

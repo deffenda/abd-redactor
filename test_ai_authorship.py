@@ -303,15 +303,32 @@ def test_redact_endpoint_returns_download(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from document_manager_web import app
+    import document_manager_web
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr("upload_redaction.comprehend_client", _FakeComprehendClient())
 
+    captured_metrics_payload: dict[str, object] = {}
+
+    def _fake_write_metrics_to_s3_and_presign(*, capability: str, source_filename: str | None, payload: dict):
+        captured_metrics_payload["capability"] = capability
+        captured_metrics_payload["source_filename"] = source_filename
+        captured_metrics_payload["payload"] = payload
+        return (
+            "web-reports/redaction/upload-metrics.json",
+            "https://example.test/web-reports/redaction/upload-metrics.json",
+        )
+
+    monkeypatch.setattr(
+        document_manager_web,
+        "_write_metrics_to_s3_and_presign",
+        _fake_write_metrics_to_s3_and_presign,
+    )
+
     pdf_path = tmp_path / "upload.pdf"
     _make_pdf(pdf_path, "SSN 123-45-6789 Email john.doe@example.com")
 
-    client = TestClient(app)
+    client = TestClient(document_manager_web.app)
     with pdf_path.open("rb") as handle:
         response = client.post(
             "/redact",
@@ -322,7 +339,11 @@ def test_redact_endpoint_returns_download(tmp_path: Path) -> None:
     assert response.headers["content-type"].startswith("application/pdf")
     assert "attachment;" in response.headers.get("content-disposition", "")
     assert "upload-redacted.pdf" in response.headers.get("content-disposition", "")
-    assert "x-redaction-stats" in response.headers
+    assert response.headers["x-redaction-metrics-key"] == "web-reports/redaction/upload-metrics.json"
+    assert response.headers["x-redaction-metrics-url"].startswith("https://example.test/")
+    assert captured_metrics_payload["capability"] == "redaction"
+    assert captured_metrics_payload["source_filename"] == "upload.pdf"
+    assert isinstance(captured_metrics_payload["payload"], dict)
     assert len(response.content) > 0
     monkeypatch.undo()
 
@@ -395,6 +416,14 @@ def test_redact_endpoint_passes_selected_engine_and_model(tmp_path: Path, monkey
         }
 
     monkeypatch.setattr(document_manager_web, "redact_uploaded_file", _fake_redact_uploaded_file)
+    monkeypatch.setattr(
+        document_manager_web,
+        "_write_metrics_to_s3_and_presign",
+        lambda **_kwargs: (
+            "web-reports/redaction/selected-engine-metrics.json",
+            "https://example.test/web-reports/redaction/selected-engine-metrics.json",
+        ),
+    )
 
     pdf_path = tmp_path / "selected-engine.pdf"
     _make_pdf(pdf_path, "Email john.doe@example.com")
@@ -452,6 +481,7 @@ def test_document_summary_endpoint_returns_download_and_passes_model_and_directi
     import document_manager_web
 
     captured: dict[str, str | None] = {}
+    captured_metrics_payload: dict[str, object] = {}
 
     def _fake_generate_document_summary_file(
         input_path: Path,
@@ -476,6 +506,21 @@ def test_document_summary_endpoint_returns_download_and_passes_model_and_directi
 
     monkeypatch.setattr(document_manager_web, "generate_document_summary_file", _fake_generate_document_summary_file)
 
+    def _fake_write_metrics_to_s3_and_presign(*, capability: str, source_filename: str | None, payload: dict):
+        captured_metrics_payload["capability"] = capability
+        captured_metrics_payload["source_filename"] = source_filename
+        captured_metrics_payload["payload"] = payload
+        return (
+            "web-reports/document-summary/summary-input-metrics.json",
+            "https://example.test/web-reports/document-summary/summary-input-metrics.json",
+        )
+
+    monkeypatch.setattr(
+        document_manager_web,
+        "_write_metrics_to_s3_and_presign",
+        _fake_write_metrics_to_s3_and_presign,
+    )
+
     pdf_path = tmp_path / "summary-input.pdf"
     _make_pdf(pdf_path, "Project timeline and risks were discussed with action owners assigned.")
 
@@ -491,8 +536,15 @@ def test_document_summary_endpoint_returns_download_and_passes_model_and_directi
     assert response.headers["content-type"].startswith("application/pdf")
     assert "attachment;" in response.headers.get("content-disposition", "")
     assert "summary-input-document-summary.pdf" in response.headers.get("content-disposition", "")
-    assert "x-document-summary-stats" in response.headers
-    stats = json.loads(response.headers["x-document-summary-stats"])
+    assert (
+        response.headers["x-document-summary-metrics-key"]
+        == "web-reports/document-summary/summary-input-metrics.json"
+    )
+    assert response.headers["x-document-summary-metrics-url"].startswith("https://example.test/")
+    assert captured_metrics_payload["capability"] == "document-summary"
+    assert captured_metrics_payload["source_filename"] == "summary-input.pdf"
+    stats = captured_metrics_payload["payload"]
+    assert isinstance(stats, dict)
     assert stats["model_name_requested"] == "gpt-5"
     assert stats["key_point_count"] == 3
     assert stats["additional_directions_provided"] is True
@@ -683,10 +735,42 @@ def test_s3_trigger_path_runs_all_three_capabilities(tmp_path: Path, monkeypatch
             "additional_directions_length": len((additional_directions or "").strip()),
         }
 
+    def _fake_generate_document_summary_report(
+        _input_path: Path,
+        *,
+        filename: str,
+        model_name: str | None = None,
+        additional_directions: str | None = None,
+    ):
+        _ = filename
+        metrics = {
+            "model_name_used": model_name or "gpt-5",
+            "input_characters": 300,
+            "characters_analyzed": 300,
+            "total_chunks": 3,
+            "chunks_analyzed": 3,
+            "chunk_char_limit": 4500,
+            "max_chunks": 12,
+            "key_point_count": 4,
+            "additional_directions_provided": bool(additional_directions),
+            "additional_directions_length": len((additional_directions or "").strip()),
+        }
+        return {
+            "source_filename": filename,
+            "summary": "Mocked S3 summary",
+            "key_points": ["Point A"],
+            "action_items": [],
+            "relevant_details": [],
+            "unanswered_questions": [],
+            "disclaimer": "Mocked disclaimer.",
+            "metrics": metrics,
+        }, metrics
+
     monkeypatch.setattr(assemble_output, "s3_client", _FakeS3Client())
     monkeypatch.setattr(assemble_output, "_upload_json", _fake_upload_json)
     monkeypatch.setattr(assemble_output, "analyze_file_authorship", _fake_analyze_file_authorship)
     monkeypatch.setattr(assemble_output, "generate_document_summary_file", _fake_generate_document_summary_file)
+    monkeypatch.setattr(assemble_output, "generate_document_summary_report", _fake_generate_document_summary_report)
 
     outputs = assemble_output._run_s3_capabilities(
         local_input=input_pdf,
@@ -705,8 +789,10 @@ def test_s3_trigger_path_runs_all_three_capabilities(tmp_path: Path, monkeypatch
 
     assert outputs["authorship"]["status"] == "COMPLETED"
     assert outputs["document_summary"]["status"] == "COMPLETED"
+    assert outputs["document_summary"]["report_key"] == "reports/sample-document-summary-report.json"
     assert ("example-bucket", "reports/sample-authorship-report.json") in uploaded_json
     assert ("example-bucket", "reports/sample-document-summary.pdf") in uploaded_files
+    assert ("example-bucket", "reports/sample-document-summary-report.json") in uploaded_json
 
 
 def test_modular_s3_pipeline_finalizes_all_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -789,12 +875,44 @@ def test_modular_s3_pipeline_finalizes_all_capabilities(tmp_path: Path, monkeypa
             "additional_directions_length": len((additional_directions or "").strip()),
         }
 
+    def _fake_generate_document_summary_report(
+        _input_path: Path,
+        *,
+        filename: str,
+        model_name: str | None = None,
+        additional_directions: str | None = None,
+    ):
+        _ = filename
+        metrics = {
+            "model_name_used": model_name or "gpt-5",
+            "input_characters": 120,
+            "characters_analyzed": 120,
+            "total_chunks": 1,
+            "chunks_analyzed": 1,
+            "chunk_char_limit": 4500,
+            "max_chunks": 12,
+            "key_point_count": 2,
+            "additional_directions_provided": bool(additional_directions),
+            "additional_directions_length": len((additional_directions or "").strip()),
+        }
+        return {
+            "source_filename": filename,
+            "summary": "Mocked modular summary",
+            "key_points": ["Key point"],
+            "action_items": [],
+            "relevant_details": [],
+            "unanswered_questions": [],
+            "disclaimer": "Mocked disclaimer.",
+            "metrics": metrics,
+        }, metrics
+
     monkeypatch.setattr(assemble_output, "s3_client", _FakeS3Client())
     monkeypatch.setattr(assemble_output, "_upload_json", _fake_upload_json)
     monkeypatch.setattr(assemble_output, "_load_json", _fake_load_json)
     monkeypatch.setattr(assemble_output, "_delete_prefix", lambda _bucket, _prefix: 4)
     monkeypatch.setattr(assemble_output, "analyze_file_authorship", _fake_analyze_file_authorship)
     monkeypatch.setattr(assemble_output, "generate_document_summary_file", _fake_generate_document_summary_file)
+    monkeypatch.setattr(assemble_output, "generate_document_summary_report", _fake_generate_document_summary_report)
 
     base_event = {
         "job_id": "job-modular-123",
@@ -842,8 +960,10 @@ def test_modular_s3_pipeline_finalizes_all_capabilities(tmp_path: Path, monkeypa
     assert final_result["capabilities"]["document_summary"]["status"] == "COMPLETED"
     assert final_result["authorship_report_key"] == "reports/sample-authorship-report.json"
     assert final_result["document_summary_pdf_key"] == "reports/sample-document-summary.pdf"
+    assert final_result["document_summary_report_key"] == "reports/sample-document-summary-report.json"
     assert ("output-bucket", "reports/sample-authorship-report.json") in uploaded_json
     assert ("output-bucket", "reports/sample-document-summary.pdf") in uploaded_files
+    assert ("output-bucket", "reports/sample-document-summary-report.json") in uploaded_json
     assert ("output-bucket", "reports/sample-redaction-report.json") in uploaded_json
 
 

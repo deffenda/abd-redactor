@@ -1,8 +1,11 @@
 import json
 import os
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
+import boto3
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
@@ -35,6 +38,9 @@ from upload_redaction import (
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 TEXT_PREVIEW_LENGTH = int(os.getenv("TEXT_PREVIEW_LENGTH", "280"))
+WEB_REPORT_BUCKET = os.getenv("WEB_REPORT_BUCKET", os.getenv("OUTPUT_BUCKET", "")).strip()
+WEB_REPORT_PREFIX = os.getenv("WEB_REPORT_PREFIX", "web-reports/").strip() or "web-reports/"
+s3_client = boto3.client("s3")
 # MODEL_DROPDOWN_OPTIONS comes from `model_inference` and intentionally includes:
 # - OpenAI model names
 # - `bedrock:*` identifiers for AWS Bedrock models
@@ -121,6 +127,55 @@ def _safe_unlink(path: Path) -> None:
         path.unlink(missing_ok=True)
     except Exception:
         pass
+
+
+def _normalize_prefix(value: str) -> str:
+    normalized = (value or "").strip()
+    if not normalized:
+        return ""
+    return normalized if normalized.endswith("/") else f"{normalized}/"
+
+
+def _sanitize_stem(filename: str | None) -> str:
+    stem = Path(filename or "document").stem.strip().lower() or "document"
+    cleaned = "".join(char if (char.isalnum() or char in {"-", "_"}) else "-" for char in stem)
+    while "--" in cleaned:
+        cleaned = cleaned.replace("--", "-")
+    return cleaned.strip("-") or "document"
+
+
+def _require_web_report_bucket() -> str:
+    if not WEB_REPORT_BUCKET:
+        raise RuntimeError(
+            "WEB_REPORT_BUCKET (or OUTPUT_BUCKET) must be set so metrics JSON can be stored in S3."
+        )
+    return WEB_REPORT_BUCKET
+
+
+def _write_metrics_to_s3_and_presign(
+    *,
+    capability: str,
+    source_filename: str | None,
+    payload: dict,
+) -> tuple[str, str]:
+    bucket = _require_web_report_bucket()
+    prefix = _normalize_prefix(WEB_REPORT_PREFIX)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    stem = _sanitize_stem(source_filename)
+    key = f"{prefix}{capability}/{stem}-{timestamp}-{uuid4().hex}.json"
+
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(payload, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    url = s3_client.generate_presigned_url(
+        ClientMethod="get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=3600,
+    )
+    return key, url
 
 
 @app.get("/health")
@@ -215,6 +270,7 @@ def home() -> str:
       <button id="redactSubmit">Redact &amp; Download</button>
       <p id="redactStatus"></p>
       <a id="downloadLink" class="download-link" hidden></a>
+      <a id="redactionMetricsLink" class="download-link" hidden></a>
       <pre id="redactResult"></pre>
     </div>
     <div class="card">
@@ -234,6 +290,7 @@ def home() -> str:
       <button id="summarySubmit">Generate Summary &amp; Download</button>
       <p id="summaryStatus"></p>
       <a id="summaryDownloadLink" class="download-link" hidden></a>
+      <a id="summaryMetricsLink" class="download-link" hidden></a>
       <pre id="summaryResult"></pre>
     </div>
   </div>
@@ -247,11 +304,13 @@ def home() -> str:
     const redactStatusEl = document.getElementById("redactStatus");
     const redactResultEl = document.getElementById("redactResult");
     const downloadLinkEl = document.getElementById("downloadLink");
+    const redactionMetricsLinkEl = document.getElementById("redactionMetricsLink");
     const summaryModelNameEl = document.getElementById("summaryModelName");
     const summaryDirectionsEl = document.getElementById("summaryDirections");
     const summaryStatusEl = document.getElementById("summaryStatus");
     const summaryResultEl = document.getElementById("summaryResult");
     const summaryDownloadLinkEl = document.getElementById("summaryDownloadLink");
+    const summaryMetricsLinkEl = document.getElementById("summaryMetricsLink");
     let lastDownloadUrl = null;
     let lastSummaryDownloadUrl = null;
 
@@ -313,6 +372,8 @@ def home() -> str:
       redactResultEl.textContent = "";
       downloadLinkEl.hidden = true;
       downloadLinkEl.removeAttribute("href");
+      redactionMetricsLinkEl.hidden = true;
+      redactionMetricsLinkEl.removeAttribute("href");
 
       const formData = new FormData();
       formData.append("file", fileInput.files[0]);
@@ -331,13 +392,8 @@ def home() -> str:
         }
 
         const blob = await response.blob();
-        const statsHeader = response.headers.get("x-redaction-stats");
-        let stats = {};
-        if (statsHeader) {
-          try {
-            stats = JSON.parse(statsHeader);
-          } catch (_error) {}
-        }
+        const metricsKey = response.headers.get("x-redaction-metrics-key") || "";
+        const metricsUrl = response.headers.get("x-redaction-metrics-url") || "";
 
         const contentDisposition = response.headers.get("content-disposition") || "";
         const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
@@ -349,9 +405,21 @@ def home() -> str:
         downloadLinkEl.download = filename;
         downloadLinkEl.textContent = `Download ${filename}`;
         downloadLinkEl.hidden = false;
+        if (metricsUrl) {
+          redactionMetricsLinkEl.href = metricsUrl;
+          redactionMetricsLinkEl.textContent = "Download redaction metrics JSON";
+          redactionMetricsLinkEl.hidden = false;
+        }
 
         redactStatusEl.textContent = "Redaction complete.";
-        redactResultEl.textContent = JSON.stringify(stats, null, 2);
+        redactResultEl.textContent = JSON.stringify(
+          {
+            metrics_key: metricsKey || null,
+            metrics_download_url: metricsUrl || null,
+          },
+          null,
+          2
+        );
       } catch (error) {
         redactStatusEl.textContent = "Redaction failed.";
         redactResultEl.textContent = String(error);
@@ -374,6 +442,8 @@ def home() -> str:
       summaryResultEl.textContent = "";
       summaryDownloadLinkEl.hidden = true;
       summaryDownloadLinkEl.removeAttribute("href");
+      summaryMetricsLinkEl.hidden = true;
+      summaryMetricsLinkEl.removeAttribute("href");
 
       const formData = new FormData();
       formData.append("file", fileInput.files[0]);
@@ -392,13 +462,8 @@ def home() -> str:
         }
 
         const blob = await response.blob();
-        const statsHeader = response.headers.get("x-document-summary-stats");
-        let stats = {};
-        if (statsHeader) {
-          try {
-            stats = JSON.parse(statsHeader);
-          } catch (_error) {}
-        }
+        const metricsKey = response.headers.get("x-document-summary-metrics-key") || "";
+        const metricsUrl = response.headers.get("x-document-summary-metrics-url") || "";
 
         const contentDisposition = response.headers.get("content-disposition") || "";
         const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/);
@@ -410,9 +475,21 @@ def home() -> str:
         summaryDownloadLinkEl.download = filename;
         summaryDownloadLinkEl.textContent = `Download ${filename}`;
         summaryDownloadLinkEl.hidden = false;
+        if (metricsUrl) {
+          summaryMetricsLinkEl.href = metricsUrl;
+          summaryMetricsLinkEl.textContent = "Download summary metrics JSON";
+          summaryMetricsLinkEl.hidden = false;
+        }
 
         summaryStatusEl.textContent = "Document summary complete.";
-        summaryResultEl.textContent = JSON.stringify(stats, null, 2);
+        summaryResultEl.textContent = JSON.stringify(
+          {
+            metrics_key: metricsKey || null,
+            metrics_download_url: metricsUrl || null,
+          },
+          null,
+          2
+        );
       } catch (error) {
         summaryStatusEl.textContent = "Document summary failed.";
         summaryResultEl.textContent = String(error);
@@ -538,6 +615,11 @@ async def redact_document(
             "redactions_per_page": metrics.get("redactions_per_page", {}),
             "entities_by_type": metrics.get("entities_by_type", {}),
         }
+        metrics_key, metrics_url = _write_metrics_to_s3_and_presign(
+            capability="redaction",
+            source_filename=file.filename or f"document{extension}",
+            payload=stats,
+        )
 
         background_tasks.add_task(_safe_unlink, input_path)
         background_tasks.add_task(_safe_unlink, output_path)
@@ -547,7 +629,10 @@ async def redact_document(
             media_type="application/pdf",
             filename=build_redacted_filename(file.filename or f"document{extension}"),
             background=background_tasks,
-            headers={"X-Redaction-Stats": json.dumps(stats, separators=(",", ":"))},
+            headers={
+                "X-Redaction-Metrics-Key": metrics_key,
+                "X-Redaction-Metrics-URL": metrics_url,
+            },
         )
     except ValueError as exc:
         if input_path:
@@ -617,6 +702,11 @@ async def generate_document_summary(
                 "Verify against the source document."
             ),
         }
+        metrics_key, metrics_url = _write_metrics_to_s3_and_presign(
+            capability="document-summary",
+            source_filename=file.filename or f"document{extension}",
+            payload=stats,
+        )
 
         background_tasks.add_task(_safe_unlink, input_path)
         background_tasks.add_task(_safe_unlink, output_path)
@@ -626,7 +716,10 @@ async def generate_document_summary(
             media_type="application/pdf",
             filename=build_document_summary_filename(file.filename or f"document{extension}"),
             background=background_tasks,
-            headers={"X-Document-Summary-Stats": json.dumps(stats, separators=(",", ":"))},
+            headers={
+                "X-Document-Summary-Metrics-Key": metrics_key,
+                "X-Document-Summary-Metrics-URL": metrics_url,
+            },
         )
     except ValueError as exc:
         if input_path:

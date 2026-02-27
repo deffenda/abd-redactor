@@ -11,7 +11,7 @@ import boto3
 import fitz
 
 from ai_authorship import DETECTOR_MODEL, analyze_file_authorship, normalize_detector
-from document_summary import generate_document_summary_file
+from document_summary import generate_document_summary_file, generate_document_summary_report
 
 
 LOGGER = logging.getLogger(__name__)
@@ -162,6 +162,12 @@ def _run_s3_capabilities(
     if include_document_summary:
         summary_output_path: Path | None = None
         try:
+            summary_report_payload, summary_metrics = generate_document_summary_report(
+                local_input,
+                filename=Path(input_key).name,
+                model_name=document_summary_model_name,
+                additional_directions=document_summary_directions,
+            )
             summary_output_path, summary_metrics = generate_document_summary_file(
                 local_input,
                 filename=Path(input_key).name,
@@ -180,9 +186,25 @@ def _run_s3_capabilities(
                 summary_pdf_key,
                 ExtraArgs={"ContentType": "application/pdf"},
             )
+            summary_report_key = _build_output_key(
+                input_key,
+                input_prefix,
+                report_prefix,
+                "-document-summary-report.json",
+            )
+            _upload_json(
+                output_bucket,
+                summary_report_key,
+                {
+                    "input_key": input_key,
+                    "summary_pdf_key": summary_pdf_key,
+                    **summary_report_payload,
+                },
+            )
             capability_outputs["document_summary"] = {
                 "status": "COMPLETED",
                 "summary_pdf_key": summary_pdf_key,
+                "report_key": summary_report_key,
                 **summary_metrics,
             }
         except Exception as exc:
@@ -296,13 +318,17 @@ def _calculate_detection_accuracy(findings_detected: int, total_boxes: int, conf
     """Calculate precision, recall, and F1 score metrics."""
     if confidence_scores is None:
         confidence_scores = []
-    
-    # Precision: redactions that are actually PII (estimated from coverage)
-    precision = (total_boxes / max(findings_detected, 1)) * 100 if findings_detected > 0 else 100.0
-    
-    # Recall: PII that was detected (redacted)
-    recall = (total_boxes / max(total_boxes, 1)) * 100 if total_boxes > 0 else 0.0
-    
+
+    findings = max(findings_detected, 0)
+    boxes = max(total_boxes, 0)
+    matched = min(findings, boxes)
+
+    # Precision: proportion of applied redaction boxes backed by detected findings.
+    precision = (matched / boxes) * 100 if boxes > 0 else 0.0
+
+    # Recall: proportion of findings that were converted into redaction boxes.
+    recall = (matched / findings) * 100 if findings > 0 else 0.0
+
     # F1 Score: harmonic mean
     if precision + recall > 0:
         f1_score = 2 * (precision * recall) / (precision + recall)
@@ -324,7 +350,7 @@ def _calculate_detection_accuracy(findings_detected: int, total_boxes: int, conf
 
 def _calculate_document_quality(total_pages: int, pages_with_redactions: int, original_size: int, redacted_size: int) -> dict:
     """Calculate readability and legibility metrics."""
-    pages_without_redactions = total_pages - pages_with_redactions
+    pages_without_redactions = max(total_pages - pages_with_redactions, 0)
     readability_score = (pages_without_redactions / max(total_pages, 1)) * 100
     
     # Estimate information preservation
@@ -373,37 +399,39 @@ def _calculate_consistency_metrics(phrases_by_page: dict[int, set[str]], redacti
 
 def _calculate_compliance_scores() -> dict:
     """Calculate HIPAA, GDPR, and other compliance scores."""
-    # These would be more accurate with domain knowledge
-    # For now, based on detection coverage and entity types
-    
-    hipaa_pii_types = {"PERSON", "DATE", "PHONE", "EMAIL", "SSN", "MEDICAL", "HEALTH"}
-    gdpr_pii_types = {"PERSON", "EMAIL", "PHONE", "ADDRESS", "CREDIT_CARD", "IDENTIFICATION"}
-    
+    # These values are heuristic placeholders and should be replaced with
+    # policy-specific rules mapped to validated controls.
     return {
         "hipaa_estimated_compliance": 95.0,  # High confidence if medical PII present
         "gdpr_estimated_compliance": 92.0,   # High confidence if personal data redacted
         "sox_estimated_compliance": 88.0,    # Based on financial data protection
         "pci_dss_estimated_compliance": 85.0,  # Credit card protection level
-        "sox_estimated_compliance": 88.0,
         "nist_cybersecurity_level": "Level 3 - Protected",
     }
 
 
 def _calculate_risk_assessment(total_boxes: int, findings_detected: int, pages_with_redactions: int, total_pages: int) -> dict:
     """Calculate residual PII risk and re-identification risk."""
-    # Risk based on what was NOT redacted
-    redaction_coverage = (total_boxes / max(findings_detected, 1)) * 100
-    unredacted_risk = 100 - redaction_coverage
-    
+    findings = max(findings_detected, 0)
+    boxes = max(total_boxes, 0)
+    if findings == 0:
+        redaction_coverage = 100.0
+    else:
+        redaction_coverage = (min(boxes, findings) / findings) * 100
+    redaction_coverage = min(100.0, max(0.0, redaction_coverage))
+    unredacted_risk = 100.0 - redaction_coverage
+
     # Re-identification risk based on coverage gaps
     page_coverage = (pages_with_redactions / max(total_pages, 1)) * 100
+    page_coverage = min(100.0, max(0.0, page_coverage))
     re_identification_risk = 100 - page_coverage
-    
+
     # Overall risk score
     overall_risk = (unredacted_risk * 0.6 + re_identification_risk * 0.4)
-    
+    overall_risk = min(100.0, max(0.0, overall_risk))
+
     risk_level = "LOW" if overall_risk < 20 else "MEDIUM" if overall_risk < 50 else "HIGH"
-    
+
     return {
         "residual_pii_risk_percent": round(unredacted_risk, 2),
         "re_identification_risk_percent": round(re_identification_risk, 2),
@@ -874,6 +902,12 @@ def document_summary_artifact_lambda_handler(event: dict, _context: object) -> d
 
     try:
         s3_client.download_file(input_bucket, input_key, str(temp_input))
+        summary_report_payload, summary_metrics = generate_document_summary_report(
+            temp_input,
+            filename=Path(input_key).name,
+            model_name=s3_summary_model_name,
+            additional_directions=s3_summary_directions,
+        )
         summary_output_path, summary_metrics = generate_document_summary_file(
             temp_input,
             filename=Path(input_key).name,
@@ -892,11 +926,27 @@ def document_summary_artifact_lambda_handler(event: dict, _context: object) -> d
             summary_pdf_key,
             ExtraArgs={"ContentType": "application/pdf"},
         )
+        summary_report_key = _build_output_key(
+            input_key,
+            input_prefix,
+            report_prefix,
+            "-document-summary-report.json",
+        )
+        _upload_json(
+            output_bucket,
+            summary_report_key,
+            {
+                "input_key": input_key,
+                "summary_pdf_key": summary_pdf_key,
+                **summary_report_payload,
+            },
+        )
         return {
             "capability": "document_summary",
             "result": {
                 "status": "COMPLETED",
                 "summary_pdf_key": summary_pdf_key,
+                "report_key": summary_report_key,
                 **summary_metrics,
             },
         }
@@ -962,6 +1012,7 @@ def finalize_report_lambda_handler(event: dict, _context: object) -> dict[str, A
     summary_output = capability_outputs.get("document_summary", {})
     if summary_output.get("status") == "COMPLETED":
         report["output"]["document_summary_pdf_key"] = summary_output.get("summary_pdf_key")
+        report["output"]["document_summary_report_key"] = summary_output.get("report_key")
 
     _upload_json(output_bucket, report_key, report)
     cleanup_deleted = _delete_prefix(work_bucket, f"{work_prefix}{job_id}/")
@@ -981,6 +1032,7 @@ def finalize_report_lambda_handler(event: dict, _context: object) -> dict[str, A
         result["authorship_report_key"] = authorship_output.get("report_key")
     if summary_output.get("status") == "COMPLETED":
         result["document_summary_pdf_key"] = summary_output.get("summary_pdf_key")
+        result["document_summary_report_key"] = summary_output.get("report_key")
     LOGGER.info("Finalize result: %s", json.dumps(result))
     return result
 
