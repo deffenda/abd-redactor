@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >-
-  Event-driven AWS pipeline to chunk large PDFs, batch-process PII detection
-  with Amazon Comprehend, and produce a fully redacted PDF plus redaction report.
+  Event-driven AWS document processing pipeline for AI detection, redaction, and
+  summary outputs using chunking, Comprehend, and model-backed capabilities.
 # AWS GovCloud / NIST SP 800-53 implementation notes:
 # - Validate that all services/models used are approved in your ATO boundary.
 # - Typical control mapping for this stack includes AC-2/AC-3/AC-6, AU-2/AU-6/AU-9,
@@ -33,7 +33,7 @@ Parameters:
   ReportPrefix:
     Type: String
     Default: reports/
-    Description: S3 key prefix where JSON redaction reports are written.
+    Description: S3 key prefix where reports and capability artifacts are written.
   WorkPrefix:
     Type: String
     Default: work/
@@ -150,7 +150,7 @@ Resources:
   PdfRedactionStateMachine:
     Type: AWS::Serverless::StateMachine
     Properties:
-      Name: !Sub "${AWS::StackName}-pdf-redaction"
+      Name: !Sub "${AWS::StackName}-document-manager"
       Type: STANDARD
       # AU-2/AU-12: Step Functions execution history can be part of auditable evidence.
       # Configure CloudWatch Logs/X-Ray retention + encryption per your organizational policy.
@@ -162,7 +162,7 @@ Resources:
         GenerateDocumentSummaryArtifactFunctionArn: !GetAtt GenerateDocumentSummaryArtifactFunction.Arn
         FinalizeReportFunctionArn: !GetAtt FinalizeReportFunction.Arn
       Definition:
-        Comment: Chunk large PDFs, detect PII in parallel batches, and build redacted outputs.
+        Comment: Process uploaded PDFs into redaction, authorship detection, and document summary artifacts.
         StartAt: PrepareChunks
         States:
           PrepareChunks:
@@ -432,7 +432,7 @@ Resources:
   S3ObjectCreatedRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: Start redaction pipeline for new objects in the pipeline bucket.
+      Description: Start document processing pipeline for new objects in the pipeline bucket.
       EventPattern:
         source:
           - aws.s3
@@ -456,16 +456,16 @@ Resources:
 
 Outputs:
   BucketName:
-    Description: S3 bucket for input PDFs, redacted outputs, and reports.
+    Description: S3 bucket for input PDFs, redacted outputs, and capability artifacts/reports.
     Value: !Ref PdfPipelineBucket
   InputPrefix:
     Description: Upload trigger prefix.
     Value: !Ref InputPrefix
   OutputPrefix:
-    Description: Redacted PDF output prefix.
+    Description: Redacted PDF output prefix (redaction capability output).
     Value: !Ref OutputPrefix
   ReportPrefix:
-    Description: JSON report output prefix.
+    Description: Processing report and capability artifact output prefix.
     Value: !Ref ReportPrefix
   WorkPrefix:
     Description: Intermediate processing prefix.

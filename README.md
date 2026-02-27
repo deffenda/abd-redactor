@@ -6,7 +6,7 @@ This project deploys an event-driven AWS pipeline that:
 2. Chunks PDF text into Comprehend-safe segments.
 3. Batches chunks and processes them in parallel with Amazon Comprehend PII detection.
 4. Produces a fully redacted PDF.
-5. Produces a JSON redaction report with quality metrics.
+5. Produces a JSON processing report with redaction quality metrics and capability statuses.
 6. Produces an AI authorship report JSON artifact from the same S3-triggered document.
 7. Produces a model-generated document summary PDF (chunked summarization path).
 
@@ -15,7 +15,7 @@ This project deploys an event-driven AWS pipeline that:
 ### Two Processing Modes
 
 #### 1. Step Functions Pipeline (Production)
-Event-driven orchestration for large-scale processing:
+Event-driven orchestration for large-scale document processing:
 - Auto-triggered by S3 uploads to `incoming/`
 - Chunks large PDFs into Comprehend-safe segments
 - Batches chunks for parallel processing
@@ -30,14 +30,15 @@ Event-driven orchestration for large-scale processing:
   - `GenerateCapabilities` (Parallel) 
     - `GenerateAuthorshipArtifactFunction` - writes S3 authorship report artifact
     - `GenerateDocumentSummaryArtifactFunction` - writes S3 document summary PDF artifact
-  - `FinalizeReportFunction` - merges capability statuses and writes the final redaction report
+  - `FinalizeReportFunction` - merges capability statuses and writes the final processing report
 
-#### 2. Direct Handler (Quick Testing)
+#### 2. Direct/Web Handlers (Quick Testing)
 Fast local testing using the Lambda handler directly:
-- `src/app.py` - standalone PDF redaction
+- `src/app.py` - standalone PDF redaction engine (used by `/redact`)
+- `src/ai_authorship_bot.py` - local web app for AI detection, redaction download, and document summary PDF generation
 - Process files immediately without Step Functions
 - Ideal for development and quick tests
-- Use `process_files.py` to invoke
+- Use `process_files.py` for redaction-engine tests or the web UI for all capabilities
 
 ### S3 Bucket Structure
 
@@ -101,6 +102,7 @@ Packaging note:
 A lightweight upload API is available for:
 - AI authorship likelihood analysis
 - Direct upload redaction with downloadable output (without waiting for S3 trigger flow)
+- Document summary PDF generation with optional user directions
 
 - Entry point: `src/ai_authorship_bot.py`
 - Supported uploads: `.pdf`, `.docx`
@@ -203,7 +205,7 @@ The SAM template includes a shared dependency Lambda Layer (`SharedDependenciesL
 Or use script:
 
 ```bash
-./scripts/deploy.sh pdf-redaction-pipeline
+./scripts/deploy.sh adb-document-manager
 ```
 
 After deploy, note outputs:
@@ -257,7 +259,7 @@ python3 process_files.py
 python3 check_s3_status.py
 ```
 
-The redacted PDFs will be in the `redacted/` folder in S3.
+The redacted PDFs will be in `redacted/`, and capability artifacts/reports will be in `reports/` in S3.
 
 ## Use It (AWS Deployment)
 
@@ -275,8 +277,8 @@ aws s3 cp ./sample.pdf s3://<BucketName>/incoming/sample.pdf
 ```
 
 After uploading, the pipeline automatically starts processing your PDF through:
-- **Step Functions**: Full chunking and batched Comprehend processing
-- **Direct Handler**: Immediate redaction (see `process_files.py`)
+- **Step Functions**: Full chunking/batched Comprehend processing plus authorship and document summary artifact generation
+- **Web API / Local Paths**: Immediate AI detection, redaction download, and document summary generation for manual uploads (`src/ai_authorship_bot.py`); `process_files.py` remains a fast redaction-engine test path
 
 ### Pipeline Outputs
 
@@ -309,10 +311,15 @@ The JSON report includes:
 
 ## Lambda Handlers
 
-- `src/preprocess_lambda.py`: Handles S3-triggered ingestion and preprocessing. Extracts and chunks PDF text, writes batch manifests to S3.
-- `src/redact_lambda.py`: Handles batch manifest events. Runs PII detection and redaction, writes redacted PDFs and reports to S3.
+- `src/start_execution.py`: Handles S3 object-created events and starts the Step Functions execution.
+- `src/prepare_chunks.py`: Extracts and chunks PDF text, then writes batch manifests to S3.
+- `src/detect_pii_batch.py`: Processes chunk batches with Comprehend for PII detection.
+- `src/assemble_redaction.py` and `src/assemble_output.py`: Applies redactions, writes the redacted PDF, and builds base report data.
+- `src/generate_authorship_artifact.py`: Generates the AI-authorship analysis artifact for the same document.
+- `src/generate_document_summary_artifact.py`: Generates the document summary PDF artifact for the same document.
+- `src/finalize_report.py`: Merges redaction and capability statuses into the final processing report.
 
-This separation improves scalability and maintainability. Each Lambda can be deployed and scaled independently.
+This modular split improves scalability and maintainability. Each Lambda can be deployed and scaled independently.
 
 ## Local Testing with SAM (Optional)
 

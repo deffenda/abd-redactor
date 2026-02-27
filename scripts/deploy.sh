@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STACK_NAME="${1:-pdf-redaction-pipeline}"
+STACK_NAME="${1:-adb-document-manager}"
 REGION="${AWS_REGION:-us-east-1}"
 INPUT_PREFIX="${INPUT_PREFIX:-incoming/}"
 OUTPUT_PREFIX="${OUTPUT_PREFIX:-redacted/}"

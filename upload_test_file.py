@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and upload a test PDF for the redaction app to process."""
+"""Create and upload a test PDF for the document manager app to process."""
 
 import sys
 sys.path.insert(0, 'src')
@@ -57,11 +57,12 @@ try:
     print("\n" + "="*60)
     print("File is now ready for processing!")
     print("="*60)
-    print("\nThe Lambda function will:")
+    print("\nThe pipeline will:")
     print("  1. Detect the uploaded file")
     print("  2. Extract text from the PDF")
     print("  3. Use AWS Comprehend to identify PII")
     print("  4. Redact the PII entities")
     print(f"  5. Upload the redacted PDF to s3://{bucket}/redacted/test_document.pdf")
+    print(f"  6. Generate authorship and document summary artifacts under s3://{bucket}/reports/")
 except Exception as e:
     print(f"✗ Upload failed: {e}")
