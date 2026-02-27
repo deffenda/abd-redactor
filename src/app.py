@@ -105,7 +105,7 @@ def redact_pdf(input_path: Path, output_path: Path) -> dict:
     total_hits = 0
     pages_with_redactions = 0
     redactions_per_page = {}
-    
+
     with fitz.open(input_path) as doc:
         for page in doc:
             page_hits = redact_page(page)
@@ -114,7 +114,7 @@ def redact_pdf(input_path: Path, output_path: Path) -> dict:
                 redactions_per_page[str(page.number + 1)] = page_hits
             total_hits += page_hits
         doc.save(output_path, garbage=4, deflate=True, clean=True)
-    
+
     return {
         "total_boxes": total_hits,
         "pages_with_redactions": pages_with_redactions,
