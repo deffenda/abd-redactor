@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from detect_pii_settings import MIN_ENTITY_SCORE, COMPREHEND_LANGUAGE, MAX_COMPREHEND_TEXT_LEN, PII_DETECTION_API
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -22,22 +23,6 @@ comprehend_client = boto3.client("comprehend")
 INPUT_PREFIX = os.getenv("INPUT_PREFIX", "incoming/")
 OUTPUT_PREFIX = os.getenv("OUTPUT_PREFIX", "redacted/")
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "")
-def _env_float(name: str, default: float) -> float:
-    """Read an environment variable and parse it as float, returning
-    `default` when the variable is missing, empty, or invalid.
-    """
-    val = os.getenv(name)
-    if val is None or str(val).strip() == "":
-        return default
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        LOGGER.warning("Invalid float for %s: %r — using default %s", name, val, default)
-        return default
-
-MIN_ENTITY_SCORE = _env_float("MIN_ENTITY_SCORE", 0.8)
-COMPREHEND_LANGUAGE = os.getenv("COMPREHEND_LANGUAGE", "en")
-MAX_COMPREHEND_TEXT_LEN = int(os.getenv("MAX_COMPREHEND_TEXT_LEN", "4500"))
 
 
 @dataclass(frozen=True)
@@ -59,24 +44,31 @@ def chunk_text(text: str, max_len: int = MAX_COMPREHEND_TEXT_LEN) -> Iterable[tu
 
 def detect_pii_phrases(text: str) -> set[str]:
     phrases: set[str] = set()
-    for chunk, _ in chunk_text(text):
-        if not chunk.strip():
-            continue
-        response = comprehend_client.detect_pii_entities(
-            Text=chunk,
-            LanguageCode=COMPREHEND_LANGUAGE,
-        )
-        for entity in response.get("Entities", []):
-            score = float(entity.get("Score", 0.0))
-            if score < MIN_ENTITY_SCORE:
+    if PII_DETECTION_API == "start_job":
+        # Use StartPiiEntitiesDetectionJob (async, S3-based)
+        # This is a placeholder: actual implementation would require S3 input/output and polling for job completion.
+        # For now, raise NotImplementedError to indicate this path is not yet implemented.
+        raise NotImplementedError("StartPiiEntitiesDetectionJob is not yet implemented in detect_pii_phrases.")
+    else:
+        # Default: use DetectPiiEntities (sync, in-memory)
+        for chunk, _ in chunk_text(text):
+            if not chunk.strip():
                 continue
-            begin = int(entity.get("BeginOffset", 0))
-            end = int(entity.get("EndOffset", 0))
-            if begin >= end:
-                continue
-            phrase = chunk[begin:end].strip()
-            if len(phrase) >= 2:
-                phrases.add(phrase)
+            response = comprehend_client.detect_pii_entities(
+                Text=chunk,
+                LanguageCode=COMPREHEND_LANGUAGE,
+            )
+            for entity in response.get("Entities", []):
+                score = float(entity.get("Score", 0.0))
+                if score < MIN_ENTITY_SCORE:
+                    continue
+                begin = int(entity.get("BeginOffset", 0))
+                end = int(entity.get("EndOffset", 0))
+                if begin >= end:
+                    continue
+                phrase = chunk[begin:end].strip()
+                if len(phrase) >= 2:
+                    phrases.add(phrase)
     return phrases
 
 

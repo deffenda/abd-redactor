@@ -180,6 +180,13 @@ The JSON report includes:
 - Redactions per page
 - Entity counts by PII type
 
+## Lambda Handlers
+
+- `src/preprocess_lambda.py`: Handles S3-triggered ingestion and preprocessing. Extracts and chunks PDF text, writes batch manifests to S3.
+- `src/redact_lambda.py`: Handles batch manifest events. Runs PII detection and redaction, writes redacted PDFs and reports to S3.
+
+This separation improves scalability and maintainability. Each Lambda can be deployed and scaled independently.
+
 ## Local Testing with SAM (Optional)
 
 For direct Step Functions testing, invoke with sample EventBridge event:
