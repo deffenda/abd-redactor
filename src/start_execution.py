@@ -42,16 +42,39 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = str(raw).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    LOGGER.warning("Invalid bool for %s=%r, using default %s", name, raw, default)
+    return default
+
+
 STATE_MACHINE_ARN = os.getenv("STATE_MACHINE_ARN", "")
 INPUT_PREFIX = _normalize_prefix(os.getenv("INPUT_PREFIX", "incoming/"))
 OUTPUT_PREFIX = _normalize_prefix(os.getenv("OUTPUT_PREFIX", "redacted/"))
 REPORT_PREFIX = _normalize_prefix(os.getenv("REPORT_PREFIX", "reports/"))
 WORK_PREFIX = _normalize_prefix(os.getenv("WORK_PREFIX", "work/"))
 OUTPUT_BUCKET = os.getenv("OUTPUT_BUCKET", "")
-from .detect_pii_settings import MIN_ENTITY_SCORE, COMPREHEND_LANGUAGE, MAX_COMPREHEND_TEXT_LEN
+try:
+    from .detect_pii_settings import MIN_ENTITY_SCORE, COMPREHEND_LANGUAGE, MAX_COMPREHEND_TEXT_LEN
+except ImportError:
+    from detect_pii_settings import MIN_ENTITY_SCORE, COMPREHEND_LANGUAGE, MAX_COMPREHEND_TEXT_LEN
 CHUNK_CHAR_LIMIT = _env_int("CHUNK_CHAR_LIMIT", 4500)
 CHUNKS_PER_BATCH = _env_int("CHUNKS_PER_BATCH", 20)
 MAP_MAX_CONCURRENCY = _env_int("MAP_MAX_CONCURRENCY", 5)
+ENABLE_S3_AUTHORSHIP = _env_bool("ENABLE_S3_AUTHORSHIP", True)
+ENABLE_S3_DOCUMENT_SUMMARY = _env_bool("ENABLE_S3_DOCUMENT_SUMMARY", True)
+REQUIRE_S3_CAPABILITIES = _env_bool("REQUIRE_S3_CAPABILITIES", False)
+S3_AUTHORSHIP_DETECTOR = os.getenv("S3_AUTHORSHIP_DETECTOR", "heuristic").strip().lower() or "heuristic"
+S3_AUTHORSHIP_MODEL = os.getenv("S3_AUTHORSHIP_MODEL", "").strip()
+S3_SUMMARY_MODEL = os.getenv("S3_SUMMARY_MODEL", "").strip()
+S3_SUMMARY_DIRECTIONS = os.getenv("S3_SUMMARY_DIRECTIONS", "").strip()
 
 
 def _extract_s3_objects(event: dict) -> list[tuple[str, str]]:
@@ -108,6 +131,13 @@ def _build_execution_input(bucket: str, key: str) -> dict:
         "chunk_char_limit": CHUNK_CHAR_LIMIT,
         "chunks_per_batch": CHUNKS_PER_BATCH,
         "map_max_concurrency": max(MAP_MAX_CONCURRENCY, 1),
+        "enable_s3_authorship": ENABLE_S3_AUTHORSHIP,
+        "enable_s3_document_summary": ENABLE_S3_DOCUMENT_SUMMARY,
+        "require_s3_capabilities": REQUIRE_S3_CAPABILITIES,
+        "s3_authorship_detector": S3_AUTHORSHIP_DETECTOR,
+        "s3_authorship_model_name": S3_AUTHORSHIP_MODEL,
+        "s3_summary_model_name": S3_SUMMARY_MODEL,
+        "s3_summary_directions": S3_SUMMARY_DIRECTIONS,
     }
 
 

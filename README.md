@@ -6,7 +6,9 @@ This project deploys an event-driven AWS pipeline that:
 2. Chunks PDF text into Comprehend-safe segments.
 3. Batches chunks and processes them in parallel with Amazon Comprehend PII detection.
 4. Produces a fully redacted PDF.
-5. Produces a JSON report with total redaction changes made.
+5. Produces a JSON redaction report with quality metrics.
+6. Produces an AI authorship report JSON artifact from the same S3-triggered document.
+7. Produces a model-generated document summary PDF (chunked summarization path).
 
 ## Architecture
 
@@ -24,7 +26,7 @@ Event-driven orchestration for large-scale processing:
 - `PdfRedactionStateMachine` (Step Functions) orchestrates
   - `PrepareChunksFunction` - downloads PDF, chunks text
   - `DetectBatchFunction` (Map state) - parallel Comprehend processing
-  - `AssembleOutputFunction` - aggregates results, redacts PDF
+  - `AssembleOutputFunction` - aggregates results, redacts PDF, and generates S3 authorship + document-summary artifacts
 
 #### 2. Direct Handler (Quick Testing)
 Fast local testing using the Lambda handler directly:
@@ -164,7 +166,9 @@ Notes:
 - `additional_directions` lets users tailor the summary from a textbox in the web UI.
 - Optional document summary model settings:
   - `OPENAI_DOCUMENT_SUMMARY_MODEL` (fallbacks: `OPENAI_CLINICAL_SUMMARY_MODEL`, then `OPENAI_AUTHORSHIP_MODEL`, then `gpt-4.1-mini`)
-  - `DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT` (fallback: `CLINICAL_SUMMARY_INPUT_CHAR_LIMIT`, default: `16000`)
+  - `DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT` (per-chunk model input cap; fallback: `CLINICAL_SUMMARY_INPUT_CHAR_LIMIT`, default: `16000`)
+  - `DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT` (summary chunk size; fallback: `CHUNK_CHAR_LIMIT`, default: `4500`)
+  - `DOCUMENT_SUMMARY_MAX_CHUNKS` (maximum chunks analyzed, default: `12`)
 - Use it with manual review and document metadata checks.
 
 ## Deploy to AWS
@@ -189,6 +193,17 @@ After deploy, note outputs:
 - `OutputPrefix`
 - `ReportPrefix`
 - `StateMachineArn`
+
+S3-trigger capability settings (SAM parameters / Lambda env):
+
+- `EnableS3Authorship` (`true`/`false`, default `true`)
+- `EnableS3DocumentSummary` (`true`/`false`, default `true`)
+- `RequireS3Capabilities` (`true`/`false`, default `false`)
+- `S3AuthorshipDetector` (`heuristic` or `model`, default `heuristic`)
+- `S3AuthorshipModel` (optional model name when detector=`model`)
+- `S3SummaryModel` (optional summary model override)
+- `S3SummaryDirections` (optional extra summary prompt instructions)
+- `OpenAIApiKey` (optional, required for model-backed S3 capabilities)
 
 ## Quick Start (Local Testing)
 
@@ -247,12 +262,16 @@ After uploading, the pipeline automatically starts processing your PDF through:
 
 - `s3://<BucketName>/redacted/sample-redacted.pdf`
 - `s3://<BucketName>/reports/sample-redaction-report.json`
+- `s3://<BucketName>/reports/sample-authorship-report.json`
+- `s3://<BucketName>/reports/sample-document-summary.pdf`
 
 Download results:
 
 ```bash
 aws s3 cp s3://<BucketName>/redacted/sample-redacted.pdf ./sample-redacted.pdf
 aws s3 cp s3://<BucketName>/reports/sample-redaction-report.json ./sample-redaction-report.json
+aws s3 cp s3://<BucketName>/reports/sample-authorship-report.json ./sample-authorship-report.json
+aws s3 cp s3://<BucketName>/reports/sample-document-summary.pdf ./sample-document-summary.pdf
 ```
 
 ## Report Content
@@ -266,6 +285,7 @@ The JSON report includes:
 - `changes_made` (same as boxes applied)
 - Redactions per page
 - Entity counts by PII type
+- Additional capability status for authorship + document summary generation
 
 ## Lambda Handlers
 

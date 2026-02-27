@@ -5,9 +5,13 @@ from collections import Counter, defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 import time
+from typing import Any
 
 import boto3
 import fitz
+
+from ai_authorship import DETECTOR_MODEL, analyze_file_authorship, normalize_detector
+from clinical_summary import generate_document_summary_file
 
 
 LOGGER = logging.getLogger(__name__)
@@ -15,6 +19,40 @@ LOGGER.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
 s3_client = boto3.client("s3")
 comprehend_client = boto3.client("comprehend")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = str(raw).strip().lower()
+    if value in {"1", "true", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+DEFAULT_S3_AUTHORSHIP_DETECTOR = os.getenv("S3_AUTHORSHIP_DETECTOR", "heuristic").strip().lower() or "heuristic"
+DEFAULT_S3_AUTHORSHIP_MODEL = os.getenv("S3_AUTHORSHIP_MODEL", "").strip() or None
+DEFAULT_S3_SUMMARY_MODEL = os.getenv("S3_SUMMARY_MODEL", "").strip() or None
+DEFAULT_S3_SUMMARY_DIRECTIONS = os.getenv("S3_SUMMARY_DIRECTIONS", "").strip()
+DEFAULT_ENABLE_S3_AUTHORSHIP = _env_bool("ENABLE_S3_AUTHORSHIP", True)
+DEFAULT_ENABLE_S3_DOCUMENT_SUMMARY = _env_bool("ENABLE_S3_DOCUMENT_SUMMARY", True)
+DEFAULT_REQUIRE_S3_CAPABILITIES = _env_bool("REQUIRE_S3_CAPABILITIES", False)
 
 
 def _normalize_prefix(value: str) -> str:
@@ -45,6 +83,109 @@ def _build_output_key(input_key: str, input_prefix: str, output_prefix: str, suf
     relative = input_key[len(input_prefix) :] if input_prefix and input_key.startswith(input_prefix) else Path(input_key).name
     stem = str(Path(relative).with_suffix(""))
     return f"{output_prefix}{stem}{suffix}"
+
+
+def _run_s3_capabilities(
+    *,
+    local_input: Path,
+    input_key: str,
+    input_prefix: str,
+    output_bucket: str,
+    report_prefix: str,
+    include_authorship: bool,
+    include_document_summary: bool,
+    require_all_capabilities: bool,
+    authorship_detector: str,
+    authorship_model_name: str | None,
+    document_summary_model_name: str | None,
+    document_summary_directions: str | None,
+) -> dict[str, Any]:
+    capability_outputs: dict[str, Any] = {}
+
+    if include_authorship:
+        try:
+            selected_detector = normalize_detector(authorship_detector)
+            selected_model = authorship_model_name if selected_detector == DETECTOR_MODEL else None
+            authorship_result, extracted_text = analyze_file_authorship(
+                local_input,
+                filename=Path(input_key).name,
+                detector=selected_detector,
+                model_name=selected_model,
+            )
+            authorship_report_key = _build_output_key(
+                input_key,
+                input_prefix,
+                report_prefix,
+                "-authorship-report.json",
+            )
+            _upload_json(
+                output_bucket,
+                authorship_report_key,
+                {
+                    "input_key": input_key,
+                    "detector_used": selected_detector,
+                    "model_name_used": selected_model,
+                    "label": authorship_result.label,
+                    "ai_probability": authorship_result.ai_probability,
+                    "confidence": authorship_result.confidence,
+                    "summary": authorship_result.summary,
+                    "features": authorship_result.features.__dict__,
+                    "text_preview": extracted_text[:600],
+                    "text_preview_truncated": len(extracted_text) > 600,
+                },
+            )
+            capability_outputs["authorship"] = {
+                "status": "COMPLETED",
+                "report_key": authorship_report_key,
+                "detector_used": selected_detector,
+                "model_name_used": selected_model,
+                "label": authorship_result.label,
+                "ai_probability": authorship_result.ai_probability,
+            }
+        except Exception as exc:
+            capability_outputs["authorship"] = {"status": "FAILED", "error": str(exc)}
+            if require_all_capabilities:
+                raise
+    else:
+        capability_outputs["authorship"] = {"status": "SKIPPED"}
+
+    if include_document_summary:
+        summary_output_path: Path | None = None
+        try:
+            summary_output_path, summary_metrics = generate_document_summary_file(
+                local_input,
+                filename=Path(input_key).name,
+                model_name=document_summary_model_name,
+                additional_directions=document_summary_directions,
+            )
+            summary_pdf_key = _build_output_key(
+                input_key,
+                input_prefix,
+                report_prefix,
+                "-document-summary.pdf",
+            )
+            s3_client.upload_file(
+                str(summary_output_path),
+                output_bucket,
+                summary_pdf_key,
+                ExtraArgs={"ContentType": "application/pdf"},
+            )
+            capability_outputs["document_summary"] = {
+                "status": "COMPLETED",
+                "summary_pdf_key": summary_pdf_key,
+                **summary_metrics,
+            }
+        except Exception as exc:
+            capability_outputs["document_summary"] = {"status": "FAILED", "error": str(exc)}
+            if require_all_capabilities:
+                raise
+        finally:
+            if summary_output_path and summary_output_path.exists():
+                summary_output_path.unlink(missing_ok=True)
+    else:
+        capability_outputs["document_summary"] = {"status": "SKIPPED"}
+
+    return capability_outputs
 
 
 def _delete_prefix(bucket: str, prefix: str) -> int:
@@ -359,6 +500,19 @@ def lambda_handler(event: dict, _context: object) -> dict:
     output_prefix = event.get("output_prefix", os.getenv("OUTPUT_PREFIX", "redacted/"))
     report_prefix = event.get("report_prefix", os.getenv("REPORT_PREFIX", "reports/"))
     work_prefix = _normalize_prefix(event.get("work_prefix", os.getenv("WORK_PREFIX", "work/")))
+    include_s3_authorship = _as_bool(event.get("enable_s3_authorship"), DEFAULT_ENABLE_S3_AUTHORSHIP)
+    include_s3_document_summary = _as_bool(
+        event.get("enable_s3_document_summary"),
+        DEFAULT_ENABLE_S3_DOCUMENT_SUMMARY,
+    )
+    require_s3_capabilities = _as_bool(
+        event.get("require_s3_capabilities"),
+        DEFAULT_REQUIRE_S3_CAPABILITIES,
+    )
+    s3_authorship_detector = str(event.get("s3_authorship_detector", DEFAULT_S3_AUTHORSHIP_DETECTOR)).strip().lower()
+    s3_authorship_model_name = str(event.get("s3_authorship_model_name", DEFAULT_S3_AUTHORSHIP_MODEL or "")).strip() or None
+    s3_summary_model_name = str(event.get("s3_summary_model_name", DEFAULT_S3_SUMMARY_MODEL or "")).strip() or None
+    s3_summary_directions = str(event.get("s3_summary_directions", DEFAULT_S3_SUMMARY_DIRECTIONS)).strip() or None
 
     batch_results = event.get("batch_results", [])
 
@@ -434,6 +588,21 @@ def lambda_handler(event: dict, _context: object) -> dict:
         output_bucket,
         redacted_key,
         ExtraArgs={"ContentType": "application/pdf"},
+    )
+
+    capability_outputs = _run_s3_capabilities(
+        local_input=local_input,
+        input_key=input_key,
+        input_prefix=input_prefix,
+        output_bucket=output_bucket,
+        report_prefix=report_prefix,
+        include_authorship=include_s3_authorship,
+        include_document_summary=include_s3_document_summary,
+        require_all_capabilities=require_s3_capabilities,
+        authorship_detector=s3_authorship_detector,
+        authorship_model_name=s3_authorship_model_name,
+        document_summary_model_name=s3_summary_model_name,
+        document_summary_directions=s3_summary_directions,
     )
 
     # Get redacted file size
@@ -553,7 +722,15 @@ def lambda_handler(event: dict, _context: object) -> dict:
             ],
             "audit_readiness": risk_assessment.get("audit_confidence_percent", 0),
         },
+        "capabilities": capability_outputs,
     }
+
+    authorship_output = capability_outputs.get("authorship", {})
+    if authorship_output.get("status") == "COMPLETED":
+        report["output"]["authorship_report_key"] = authorship_output.get("report_key")
+    summary_output = capability_outputs.get("document_summary", {})
+    if summary_output.get("status") == "COMPLETED":
+        report["output"]["document_summary_pdf_key"] = summary_output.get("summary_pdf_key")
 
     _upload_json(output_bucket, report_key, report)
 
@@ -568,6 +745,11 @@ def lambda_handler(event: dict, _context: object) -> dict:
         "changes_made": total_boxes,
         "effectiveness_score": round(effectiveness_score, 2),
         "work_objects_deleted": cleanup_deleted,
+        "capabilities": capability_outputs,
     }
+    if capability_outputs.get("authorship", {}).get("status") == "COMPLETED":
+        result["authorship_report_key"] = capability_outputs["authorship"].get("report_key")
+    if capability_outputs.get("document_summary", {}).get("status") == "COMPLETED":
+        result["document_summary_pdf_key"] = capability_outputs["document_summary"].get("summary_pdf_key")
     LOGGER.info("Assemble result: %s", json.dumps(result))
     return result

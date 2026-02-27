@@ -8,6 +8,7 @@ from typing import Any
 import fitz  # PyMuPDF
 
 from ai_authorship import DEFAULT_OPENAI_MODEL, SUPPORTED_EXTENSIONS, extract_text_from_file, normalize_text
+from prepare_chunks import chunk_text
 
 
 SUPPORTED_DOCUMENT_SUMMARY_EXTENSIONS = set(SUPPORTED_EXTENSIONS)
@@ -31,6 +32,11 @@ DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT = _read_env_int(
     "DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT",
     _read_env_int("CLINICAL_SUMMARY_INPUT_CHAR_LIMIT", 16000),
 )
+DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT = _read_env_int(
+    "DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT",
+    _read_env_int("CHUNK_CHAR_LIMIT", 4500),
+)
+DOCUMENT_SUMMARY_MAX_CHUNKS = _read_env_int("DOCUMENT_SUMMARY_MAX_CHUNKS", 12)
 
 
 def build_document_summary_filename(filename: str) -> str:
@@ -177,6 +183,57 @@ def _format_section(lines: list[str], title: str, values: list[str], empty_text:
     lines.append("")
 
 
+def _dedupe_preserve(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    values: list[str] = []
+    for item in items:
+        normalized = item.strip()
+        if not normalized:
+            continue
+        key = normalized.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(normalized)
+    return values
+
+
+def _merge_chunk_payloads(payloads: list[dict[str, Any]]) -> dict[str, Any]:
+    if not payloads:
+        raise RuntimeError("Document summary model produced no chunk outputs.")
+
+    summary_segments: list[str] = []
+    key_points: list[str] = []
+    action_items: list[str] = []
+    relevant_details: list[str] = []
+    unanswered_questions: list[str] = []
+    disclaimer = ""
+
+    for payload in payloads:
+        summary = _string_value(payload.get("summary"), "")
+        if summary:
+            summary_segments.append(summary)
+        key_points.extend(_string_list(payload.get("key_points")))
+        action_items.extend(_string_list(payload.get("action_items")))
+        relevant_details.extend(_string_list(payload.get("relevant_details")))
+        unanswered_questions.extend(_string_list(payload.get("unanswered_questions")))
+        if not disclaimer:
+            disclaimer = _string_value(payload.get("disclaimer"), "")
+
+    combined_summary = "\n\n".join(summary_segments).strip()
+    if not combined_summary:
+        combined_summary = "No summary was generated."
+
+    return {
+        "summary": combined_summary,
+        "key_points": _dedupe_preserve(key_points),
+        "action_items": _dedupe_preserve(action_items),
+        "relevant_details": _dedupe_preserve(relevant_details),
+        "unanswered_questions": _dedupe_preserve(unanswered_questions),
+        "disclaimer": disclaimer or "AI-generated summary for review support only. Verify against the original document.",
+    }
+
+
 def _render_document_summary_text(
     payload: dict[str, Any],
     *,
@@ -276,15 +333,38 @@ def generate_document_summary_file(
         raise ValueError("No extractable text found in uploaded file.")
 
     effective_model = (model_name or DEFAULT_DOCUMENT_SUMMARY_MODEL).strip() or DEFAULT_DOCUMENT_SUMMARY_MODEL
-    truncated_text = normalized[:DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT]
     directions = (additional_directions or "").strip()
-    payload = _call_document_summary_model(truncated_text, effective_model, additional_directions=directions or None)
+    all_chunks = chunk_text(normalized, DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT)
+    if not all_chunks:
+        raise ValueError("No extractable text chunks found in uploaded file.")
+
+    if DOCUMENT_SUMMARY_MAX_CHUNKS > 0:
+        selected_chunks = all_chunks[:DOCUMENT_SUMMARY_MAX_CHUNKS]
+    else:
+        selected_chunks = all_chunks
+
+    payloads: list[dict[str, Any]] = []
+    characters_analyzed = 0
+    for chunk in selected_chunks:
+        model_input = chunk[:DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT].strip()
+        if not model_input:
+            continue
+        payloads.append(
+            _call_document_summary_model(
+                model_input,
+                effective_model,
+                additional_directions=directions or None,
+            )
+        )
+        characters_analyzed += len(model_input)
+
+    payload = _merge_chunk_payloads(payloads)
 
     summary_text = _render_document_summary_text(
         payload,
         source_filename=filename,
         model_name=effective_model,
-        analyzed_chars=len(truncated_text),
+        analyzed_chars=characters_analyzed,
         original_chars=len(normalized),
         additional_directions=directions or None,
     )
@@ -297,7 +377,11 @@ def generate_document_summary_file(
     metrics = {
         "model_name_used": effective_model,
         "input_characters": len(normalized),
-        "characters_analyzed": len(truncated_text),
+        "characters_analyzed": characters_analyzed,
+        "total_chunks": len(all_chunks),
+        "chunks_analyzed": len(payloads),
+        "chunk_char_limit": DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT,
+        "max_chunks": DOCUMENT_SUMMARY_MAX_CHUNKS,
         "key_point_count": len(payload.get("key_points", [])) if isinstance(payload.get("key_points", []), list) else 0,
         "additional_directions_provided": bool(directions),
         "additional_directions_length": len(directions),
@@ -309,6 +393,8 @@ def generate_document_summary_file(
 SUPPORTED_CLINICAL_SUMMARY_EXTENSIONS = SUPPORTED_DOCUMENT_SUMMARY_EXTENSIONS
 DEFAULT_CLINICAL_SUMMARY_MODEL = DEFAULT_DOCUMENT_SUMMARY_MODEL
 CLINICAL_SUMMARY_INPUT_CHAR_LIMIT = DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT
+CLINICAL_SUMMARY_CHUNK_CHAR_LIMIT = DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT
+CLINICAL_SUMMARY_MAX_CHUNKS = DOCUMENT_SUMMARY_MAX_CHUNKS
 
 
 def build_clinical_summary_filename(filename: str) -> str:

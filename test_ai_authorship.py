@@ -1,4 +1,5 @@
 import json
+import importlib
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -510,3 +511,173 @@ def test_document_summary_requires_api_key(tmp_path: Path, monkeypatch: pytest.M
 
     assert response.status_code == 503
     assert "OPENAI_API_KEY" in response.json()["detail"]
+
+
+def test_document_summary_uses_chunking_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import clinical_summary
+
+    pdf_path = tmp_path / "chunked-summary.pdf"
+    _make_pdf(
+        pdf_path,
+        "Alpha details. " * 80 + "Beta details. " * 80 + "Gamma details. " * 80,
+    )
+
+    observed_chunks: list[str] = []
+
+    def _fake_chunk_text(_text: str, _max_chars: int) -> list[str]:
+        return ["chunk-one-text", "chunk-two-text"]
+
+    def _fake_call_document_summary_model(text: str, _model_name: str, additional_directions: str | None = None) -> dict:
+        observed_chunks.append(text)
+        return {
+            "summary": f"Summary for {text}.",
+            "key_points": [f"Point from {text}"],
+            "action_items": [f"Action from {text}"],
+            "relevant_details": [f"Detail from {text}"],
+            "unanswered_questions": [],
+            "disclaimer": f"Directions={additional_directions or ''}",
+        }
+
+    monkeypatch.setattr(clinical_summary, "chunk_text", _fake_chunk_text)
+    monkeypatch.setattr(clinical_summary, "_call_document_summary_model", _fake_call_document_summary_model)
+
+    output_path, metrics = clinical_summary.generate_document_summary_file(
+        pdf_path,
+        filename="chunked-summary.pdf",
+        model_name="gpt-5",
+        additional_directions="Focus on actions.",
+    )
+    try:
+        assert output_path.exists()
+        assert metrics["total_chunks"] == 2
+        assert metrics["chunks_analyzed"] == 2
+        assert metrics["characters_analyzed"] > 0
+        assert observed_chunks == ["chunk-one-text", "chunk-two-text"]
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
+def test_s3_trigger_path_runs_all_three_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    import assemble_output
+
+    input_pdf = tmp_path / "incoming-s3.pdf"
+    _make_pdf(input_pdf, "S3-trigger text for redaction, authorship, and summary.")
+
+    uploaded_files: dict[tuple[str, str], dict[str, str]] = {}
+    uploaded_json: dict[tuple[str, str], dict] = {}
+
+    class _FakeS3Client:
+        def upload_file(self, filename: str, bucket: str, key: str, ExtraArgs: dict | None = None) -> None:
+            uploaded_files[(bucket, key)] = {
+                "filename": filename,
+                "content_type": (ExtraArgs or {}).get("ContentType", ""),
+            }
+
+    def _fake_upload_json(bucket: str, key: str, payload: dict) -> None:
+        uploaded_json[(bucket, key)] = payload
+
+    def _fake_analyze_file_authorship(
+        _path: Path,
+        filename: str | None = None,
+        detector: str = "heuristic",
+        model_name: str | None = None,
+    ):
+        _ = filename
+        _ = detector
+        _ = model_name
+        result = SimpleNamespace(
+            label="likely_human",
+            ai_probability=0.2,
+            confidence=0.9,
+            summary="Mocked authorship summary.",
+            features=SimpleNamespace(
+                word_count=120,
+                sentence_count=8,
+                avg_sentence_length=15.0,
+                sentence_length_stddev=4.0,
+                type_token_ratio=0.7,
+                repeated_bigram_ratio=0.01,
+                stopword_ratio=0.4,
+                punctuation_density=0.05,
+            ),
+        )
+        return result, "mocked extracted text"
+
+    def _fake_generate_document_summary_file(
+        _input_path: Path,
+        *,
+        filename: str,
+        model_name: str | None = None,
+        additional_directions: str | None = None,
+    ):
+        _ = filename
+        _ = model_name
+        _ = additional_directions
+        output_path = tmp_path / "s3-summary.pdf"
+        _make_pdf(output_path, "Mocked S3 document summary.")
+        return output_path, {
+            "model_name_used": model_name or "gpt-5",
+            "input_characters": 300,
+            "characters_analyzed": 300,
+            "total_chunks": 3,
+            "chunks_analyzed": 3,
+            "chunk_char_limit": 4500,
+            "max_chunks": 12,
+            "key_point_count": 4,
+            "additional_directions_provided": bool(additional_directions),
+            "additional_directions_length": len((additional_directions or "").strip()),
+        }
+
+    monkeypatch.setattr(assemble_output, "s3_client", _FakeS3Client())
+    monkeypatch.setattr(assemble_output, "_upload_json", _fake_upload_json)
+    monkeypatch.setattr(assemble_output, "analyze_file_authorship", _fake_analyze_file_authorship)
+    monkeypatch.setattr(assemble_output, "generate_document_summary_file", _fake_generate_document_summary_file)
+
+    outputs = assemble_output._run_s3_capabilities(
+        local_input=input_pdf,
+        input_key="incoming/sample.pdf",
+        input_prefix="incoming/",
+        output_bucket="example-bucket",
+        report_prefix="reports/",
+        include_authorship=True,
+        include_document_summary=True,
+        require_all_capabilities=True,
+        authorship_detector="heuristic",
+        authorship_model_name=None,
+        document_summary_model_name="gpt-5",
+        document_summary_directions="Focus on risks.",
+    )
+
+    assert outputs["authorship"]["status"] == "COMPLETED"
+    assert outputs["document_summary"]["status"] == "COMPLETED"
+    assert ("example-bucket", "reports/sample-authorship-report.json") in uploaded_json
+    assert ("example-bucket", "reports/sample-document-summary.pdf") in uploaded_files
+
+
+def test_start_execution_includes_s3_capability_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    monkeypatch.setenv("ENABLE_S3_AUTHORSHIP", "true")
+    monkeypatch.setenv("ENABLE_S3_DOCUMENT_SUMMARY", "true")
+    monkeypatch.setenv("REQUIRE_S3_CAPABILITIES", "false")
+    monkeypatch.setenv("S3_AUTHORSHIP_DETECTOR", "model")
+    monkeypatch.setenv("S3_AUTHORSHIP_MODEL", "gpt-5")
+    monkeypatch.setenv("S3_SUMMARY_MODEL", "gpt-5")
+    monkeypatch.setenv("S3_SUMMARY_DIRECTIONS", "Highlight deadlines.")
+
+    import start_execution
+
+    reloaded = importlib.reload(start_execution)
+    payload = reloaded._build_execution_input("bucket-a", "incoming/sample.pdf")
+
+    assert payload["enable_s3_authorship"] is True
+    assert payload["enable_s3_document_summary"] is True
+    assert payload["require_s3_capabilities"] is False
+    assert payload["s3_authorship_detector"] == "model"
+    assert payload["s3_authorship_model_name"] == "gpt-5"
+    assert payload["s3_summary_model_name"] == "gpt-5"
+    assert payload["s3_summary_directions"] == "Highlight deadlines."

@@ -51,6 +51,51 @@ Parameters:
     Type: Number
     Default: 5
     Description: Parallel batch-processing concurrency in Step Functions Map state.
+  EnableS3Authorship:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Whether S3-triggered pipeline also generates AI authorship report artifacts.
+  EnableS3DocumentSummary:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Whether S3-triggered pipeline also generates document summary PDF artifacts.
+  RequireS3Capabilities:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: If true, fail pipeline when authorship or summary generation fails.
+  S3AuthorshipDetector:
+    Type: String
+    Default: heuristic
+    AllowedValues:
+      - heuristic
+      - model
+    Description: Detector used for S3-triggered authorship analysis.
+  S3AuthorshipModel:
+    Type: String
+    Default: ""
+    Description: Optional model name when S3AuthorshipDetector=model.
+  S3SummaryModel:
+    Type: String
+    Default: ""
+    Description: Optional model name for S3-triggered document summary generation.
+  S3SummaryDirections:
+    Type: String
+    Default: ""
+    Description: Optional additional directions appended to S3-triggered summary prompts.
+  OpenAIApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Optional OpenAI API key for model-backed S3 capabilities.
 
 Resources:
   PdfPipelineBucket:
@@ -154,6 +199,13 @@ Resources:
           CHUNK_CHAR_LIMIT: !Ref ChunkCharLimit
           CHUNKS_PER_BATCH: !Ref ChunksPerBatch
           MAP_MAX_CONCURRENCY: !Ref MapMaxConcurrency
+          ENABLE_S3_AUTHORSHIP: !Ref EnableS3Authorship
+          ENABLE_S3_DOCUMENT_SUMMARY: !Ref EnableS3DocumentSummary
+          REQUIRE_S3_CAPABILITIES: !Ref RequireS3Capabilities
+          S3_AUTHORSHIP_DETECTOR: !Ref S3AuthorshipDetector
+          S3_AUTHORSHIP_MODEL: !Ref S3AuthorshipModel
+          S3_SUMMARY_MODEL: !Ref S3SummaryModel
+          S3_SUMMARY_DIRECTIONS: !Ref S3SummaryDirections
           LOG_LEVEL: INFO
       Policies:
         - Statement:
@@ -215,6 +267,14 @@ Resources:
           OUTPUT_PREFIX: !Ref OutputPrefix
           REPORT_PREFIX: !Ref ReportPrefix
           WORK_PREFIX: !Ref WorkPrefix
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+          ENABLE_S3_AUTHORSHIP: !Ref EnableS3Authorship
+          ENABLE_S3_DOCUMENT_SUMMARY: !Ref EnableS3DocumentSummary
+          REQUIRE_S3_CAPABILITIES: !Ref RequireS3Capabilities
+          S3_AUTHORSHIP_DETECTOR: !Ref S3AuthorshipDetector
+          S3_AUTHORSHIP_MODEL: !Ref S3AuthorshipModel
+          S3_SUMMARY_MODEL: !Ref S3SummaryModel
+          S3_SUMMARY_DIRECTIONS: !Ref S3SummaryDirections
           LOG_LEVEL: INFO
       Policies:
         - S3CrudPolicy:
