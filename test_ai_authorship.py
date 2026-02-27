@@ -62,7 +62,7 @@ def test_analyze_endpoint_pdf(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     pdf_path = tmp_path / "endpoint.pdf"
     _make_pdf(pdf_path, "The meeting notes were finalized and shared with the team.")
@@ -94,7 +94,7 @@ def test_analyze_endpoint_rejects_invalid_detector(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     pdf_path = tmp_path / "invalid-endpoint.pdf"
     _make_pdf(pdf_path, "A short document for endpoint validation.")
@@ -115,7 +115,7 @@ def test_model_detector_requires_api_key(tmp_path: Path, monkeypatch: pytest.Mon
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
@@ -138,7 +138,7 @@ def test_analyze_endpoint_rejects_invalid_model_name(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     pdf_path = tmp_path / "invalid-model.pdf"
     _make_pdf(pdf_path, "Text for invalid model test.")
@@ -159,7 +159,7 @@ def test_analyze_endpoint_passes_selected_model(tmp_path: Path, monkeypatch: pyt
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    import ai_authorship_bot
+    import document_manager_web
 
     captured: dict[str, str | None] = {}
 
@@ -184,12 +184,12 @@ def test_analyze_endpoint_passes_selected_model(tmp_path: Path, monkeypatch: pyt
         )
         return result, "mock text"
 
-    monkeypatch.setattr(ai_authorship_bot, "analyze_file_authorship", _fake_analyze_file_authorship)
+    monkeypatch.setattr(document_manager_web, "analyze_file_authorship", _fake_analyze_file_authorship)
 
     pdf_path = tmp_path / "selected-model.pdf"
     _make_pdf(pdf_path, "Text for selected model test.")
 
-    client = TestClient(ai_authorship_bot.app)
+    client = TestClient(document_manager_web.app)
     with pdf_path.open("rb") as handle:
         response = client.post(
             "/analyze",
@@ -208,7 +208,7 @@ def test_analyze_endpoint_accepts_bedrock_model_name(tmp_path: Path, monkeypatch
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    import ai_authorship_bot
+    import document_manager_web
 
     captured: dict[str, str | None] = {}
 
@@ -235,13 +235,13 @@ def test_analyze_endpoint_accepts_bedrock_model_name(tmp_path: Path, monkeypatch
         )
         return result, "mock text"
 
-    monkeypatch.setattr(ai_authorship_bot, "analyze_file_authorship", _fake_analyze_file_authorship)
+    monkeypatch.setattr(document_manager_web, "analyze_file_authorship", _fake_analyze_file_authorship)
 
     pdf_path = tmp_path / "selected-bedrock-model.pdf"
     _make_pdf(pdf_path, "Text for selected Bedrock model test.")
 
     selected_model = "bedrock:anthropic.claude-3-7-sonnet-20250219-v1:0"
-    client = TestClient(ai_authorship_bot.app)
+    client = TestClient(document_manager_web.app)
     with pdf_path.open("rb") as handle:
         response = client.post(
             "/analyze",
@@ -303,7 +303,7 @@ def test_redact_endpoint_returns_download(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     monkeypatch = pytest.MonkeyPatch()
     monkeypatch.setattr("upload_redaction.comprehend_client", _FakeComprehendClient())
@@ -331,7 +331,7 @@ def test_redact_endpoint_rejects_invalid_engine(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     pdf_path = tmp_path / "invalid-engine.pdf"
     _make_pdf(pdf_path, "Email john.doe@example.com")
@@ -352,7 +352,7 @@ def test_redact_model_engine_requires_api_key(tmp_path: Path, monkeypatch: pytes
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
@@ -375,7 +375,7 @@ def test_redact_endpoint_passes_selected_engine_and_model(tmp_path: Path, monkey
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    import ai_authorship_bot
+    import document_manager_web
 
     captured: dict[str, str | None] = {}
 
@@ -394,12 +394,12 @@ def test_redact_endpoint_passes_selected_engine_and_model(tmp_path: Path, monkey
             "entities_by_type": {},
         }
 
-    monkeypatch.setattr(ai_authorship_bot, "redact_uploaded_file", _fake_redact_uploaded_file)
+    monkeypatch.setattr(document_manager_web, "redact_uploaded_file", _fake_redact_uploaded_file)
 
     pdf_path = tmp_path / "selected-engine.pdf"
     _make_pdf(pdf_path, "Email john.doe@example.com")
 
-    client = TestClient(ai_authorship_bot.app)
+    client = TestClient(document_manager_web.app)
     with pdf_path.open("rb") as handle:
         response = client.post(
             "/redact",
@@ -418,7 +418,7 @@ def test_redact_endpoint_rejects_docx(tmp_path: Path) -> None:
     pytest.importorskip("docx")
     from docx import Document
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     input_path = tmp_path / "upload.docx"
     document = Document()
@@ -449,7 +449,7 @@ def test_document_summary_endpoint_returns_download_and_passes_model_and_directi
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    import ai_authorship_bot
+    import document_manager_web
 
     captured: dict[str, str | None] = {}
 
@@ -474,12 +474,12 @@ def test_document_summary_endpoint_returns_download_and_passes_model_and_directi
             "additional_directions_length": len((additional_directions or "").strip()),
         }
 
-    monkeypatch.setattr(ai_authorship_bot, "generate_document_summary_file", _fake_generate_document_summary_file)
+    monkeypatch.setattr(document_manager_web, "generate_document_summary_file", _fake_generate_document_summary_file)
 
     pdf_path = tmp_path / "summary-input.pdf"
     _make_pdf(pdf_path, "Project timeline and risks were discussed with action owners assigned.")
 
-    client = TestClient(ai_authorship_bot.app)
+    client = TestClient(document_manager_web.app)
     with pdf_path.open("rb") as handle:
         response = client.post(
             "/document-summary",
@@ -504,7 +504,7 @@ def test_document_summary_endpoint_rejects_invalid_model_name(tmp_path: Path) ->
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     pdf_path = tmp_path / "invalid-summary-model.pdf"
     _make_pdf(pdf_path, "Summary model validation text.")
@@ -525,7 +525,7 @@ def test_document_summary_endpoint_rejects_invalid_file_type(tmp_path: Path) -> 
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     txt_path = tmp_path / "not-supported.txt"
     txt_path.write_text("plain text input", encoding="utf-8")
@@ -546,7 +546,7 @@ def test_document_summary_requires_api_key(tmp_path: Path, monkeypatch: pytest.M
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from ai_authorship_bot import app
+    from document_manager_web import app
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
