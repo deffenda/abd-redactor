@@ -80,6 +80,93 @@ source .venv/bin/activate
 pip install -r src/requirements.txt
 ```
 
+## AI Authorship Detection Bot (PDF + Word)
+
+A lightweight upload API is available for:
+- AI authorship likelihood analysis
+- Direct upload redaction with downloadable output (without waiting for S3 trigger flow)
+
+- Entry point: `src/ai_authorship_bot.py`
+- Supported uploads: `.pdf`, `.docx`
+- Browser UI: `GET /`
+- Selectable detectors: `heuristic` (default) and `model`
+- Model dropdown for model-backed detection: `gpt-4`, `gpt-4.1`, `gpt-5`, `gpt-5.2-pro`
+- Detection endpoint: `POST /analyze` (multipart file upload)
+- Redaction endpoint: `POST /redact` (PDF only; returns redacted file download)
+- Redaction engines:
+  - `comprehend` (default): Comprehend + chunking + dedupe
+  - `model`: model-based findings + chunking + dedupe
+
+Run locally:
+
+```bash
+source .venv/bin/activate
+uvicorn ai_authorship_bot:app --app-dir src --reload --port 8000
+```
+
+Example request:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/analyze" \
+  -F "detector=heuristic" \
+  -F "file=@/path/to/document.pdf"
+```
+
+Model-backed request with explicit model:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/analyze" \
+  -F "detector=model" \
+  -F "model_name=gpt-5.2-pro" \
+  -F "file=@/path/to/document.pdf"
+```
+
+Redaction request:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/redact" \
+  -F "redaction_engine=comprehend" \
+  -F "file=@/path/to/document.pdf" \
+  -o ./document-redacted.pdf
+```
+
+Model-based redaction request:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/redact" \
+  -F "redaction_engine=model" \
+  -F "model_name=gpt-5" \
+  -F "file=@/path/to/document.pdf" \
+  -o ./document-redacted.pdf
+```
+
+Document summary request:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/document-summary" \
+  -F "model_name=gpt-5" \
+  -F "additional_directions=Focus on risks, deadlines, and action items." \
+  -F "file=@/path/to/document.pdf" \
+  -o ./document-summary.pdf
+```
+
+Notes:
+- `heuristic` is local and requires no external API.
+- `model` uses the OpenAI API and requires `OPENAI_API_KEY`.
+- Optional model settings:
+  - `OPENAI_AUTHORSHIP_MODEL` (default: `gpt-4.1-mini`)
+  - `MODEL_INPUT_CHAR_LIMIT` (default: `12000`)
+- `/redact` uses the same Comprehend + chunking + dedupe logic as the S3 pipeline.
+- Optional redaction model settings:
+  - `OPENAI_REDACTION_MODEL` (default fallback: `OPENAI_AUTHORSHIP_MODEL`, then `gpt-4.1`)
+  - `MODEL_REDACTION_INPUT_CHAR_LIMIT` (default: `9000`)
+- `/document-summary` supports `.pdf` and `.docx`, and returns a downloadable `.pdf` file.
+- `additional_directions` lets users tailor the summary from a textbox in the web UI.
+- Optional document summary model settings:
+  - `OPENAI_DOCUMENT_SUMMARY_MODEL` (fallbacks: `OPENAI_CLINICAL_SUMMARY_MODEL`, then `OPENAI_AUTHORSHIP_MODEL`, then `gpt-4.1-mini`)
+  - `DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT` (fallback: `CLINICAL_SUMMARY_INPUT_CHAR_LIMIT`, default: `16000`)
+- Use it with manual review and document metadata checks.
+
 ## Deploy to AWS
 
 ### Full SAM Deployment
