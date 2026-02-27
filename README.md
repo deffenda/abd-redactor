@@ -1,4 +1,4 @@
-# AWS PDF Redaction Pipeline (Chunked + Batched Comprehend)
+# ADB Document Manager (AI Detection / Redaction / Summary)
 
 This project deploys an event-driven AWS pipeline that:
 
