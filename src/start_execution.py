@@ -10,6 +10,11 @@ import boto3
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
+# AWS-specific: boto3 resolves credentials from the runtime environment (IAM role/env/profile).
+# This client requires `states:StartExecution` on the configured state machine ARN.
+# NIST 800-53 alignment:
+# - AC-6: keep role policy scoped to this workflow ARN only.
+# - AU-2/AU-12: rely on CloudTrail + CloudWatch logs for invocation audit trail.
 sfn_client = boto3.client("stepfunctions")
 
 
@@ -78,6 +83,9 @@ S3_SUMMARY_DIRECTIONS = os.getenv("S3_SUMMARY_DIRECTIONS", "").strip()
 
 
 def _extract_s3_objects(event: dict) -> list[tuple[str, str]]:
+    # Supports both native S3 event records and EventBridge "Object Created" events.
+    # If your trigger source changes, extend this parser to match the new event shape.
+    # AU-3: preserve source bucket/key metadata through the workflow for traceability.
     objects: list[tuple[str, str]] = []
 
     if event.get("Records"):
@@ -116,6 +124,9 @@ def _is_source_pdf(key: str) -> bool:
 
 def _build_execution_input(bucket: str, key: str) -> dict:
     job_id = uuid.uuid4().hex
+    # This payload is the contract with the Step Functions workflow.
+    # If you add/rename fields here, update the state machine definition and downstream lambdas.
+    # CM-3/CM-6: treat this schema as controlled configuration and version changes with IaC updates.
     return {
         "job_id": job_id,
         "input_bucket": bucket,
@@ -145,6 +156,8 @@ def lambda_handler(event: dict, _context: object) -> dict:
     LOGGER.info("Received event: %s", json.dumps(event))
 
     if not STATE_MACHINE_ARN:
+        # In AWS, set STATE_MACHINE_ARN via SAM/CloudFormation env vars.
+        # CM-2: missing env configuration indicates deployment drift/misconfiguration.
         raise RuntimeError("STATE_MACHINE_ARN environment variable is required")
 
     started = []

@@ -26,7 +26,11 @@ Event-driven orchestration for large-scale processing:
 - `PdfRedactionStateMachine` (Step Functions) orchestrates
   - `PrepareChunksFunction` - downloads PDF, chunks text
   - `DetectBatchFunction` (Map state) - parallel Comprehend processing
-  - `AssembleOutputFunction` - aggregates results, redacts PDF, and generates S3 authorship + document-summary artifacts
+  - `AssembleRedactionFunction` - aggregates batch findings and writes redacted PDF + base metrics
+  - `GenerateCapabilities` (Parallel) 
+    - `GenerateAuthorshipArtifactFunction` - writes S3 authorship report artifact
+    - `GenerateDocumentSummaryArtifactFunction` - writes S3 document summary PDF artifact
+  - `FinalizeReportFunction` - merges capability statuses and writes the final redaction report
 
 #### 2. Direct Handler (Quick Testing)
 Fast local testing using the Lambda handler directly:
@@ -47,10 +51,15 @@ Fast local testing using the Lambda handler directly:
 
 ### Core Application
 - `template.yaml` - AWS SAM infrastructure and orchestration
+- `layer/requirements.txt` - shared Lambda dependency layer package manifest
 - `src/start_execution.py` - S3 event -> Step Functions starter
 - `src/prepare_chunks.py` - chunking and batch manifest generation
 - `src/detect_pii_batch.py` - per-batch Comprehend PII detection
-- `src/assemble_output.py` - final redacted PDF + report generation
+- `src/assemble_redaction.py` - Lambda handler for redaction assembly step
+- `src/generate_authorship_artifact.py` - Lambda handler for S3 authorship artifact generation
+- `src/generate_document_summary_artifact.py` - Lambda handler for S3 summary artifact generation
+- `src/finalize_report.py` - Lambda handler for final report merge + cleanup
+- `src/assemble_output.py` - shared pipeline logic used by the modular Lambda handlers
 - `src/app.py` - Direct PDF redaction handler (alternative to Step Functions)
 
 ### Helper Scripts
@@ -79,8 +88,13 @@ Fast local testing using the Lambda handler directly:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r src/requirements.txt
+pip install -r requirements-local.txt
 ```
+
+Packaging note:
+- `requirements-local.txt` is for local development/testing.
+- `src/requirements.txt` is intentionally minimal for Lambda artifact packaging.
+- Heavy shared dependencies are built into `SharedDependenciesLayer` from `layer/requirements.txt`.
 
 ## AI Authorship Detection Bot (PDF + Word)
 
@@ -92,7 +106,7 @@ A lightweight upload API is available for:
 - Supported uploads: `.pdf`, `.docx`
 - Browser UI: `GET /`
 - Selectable detectors: `heuristic` (default) and `model`
-- Model dropdown for model-backed detection: `gpt-4`, `gpt-4.1`, `gpt-5`, `gpt-5.2-pro`
+- Model dropdown for model-backed flows includes OpenAI and AWS Bedrock options (Claude 3.7 Sonnet, Claude 3.5 Sonnet v2, Nova Pro, Nova Lite)
 - Detection endpoint: `POST /analyze` (multipart file upload)
 - Redaction endpoint: `POST /redact` (PDF only; returns redacted file download)
 - Redaction engines:
@@ -154,7 +168,11 @@ curl -X POST "http://127.0.0.1:8000/document-summary" \
 
 Notes:
 - `heuristic` is local and requires no external API.
-- `model` uses the OpenAI API and requires `OPENAI_API_KEY`.
+- `model` supports OpenAI and AWS Bedrock model choices from the dropdown.
+- OpenAI selections require `OPENAI_API_KEY`.
+- AWS Bedrock selections require AWS credentials plus Bedrock model access in your configured region.
+- Optional Bedrock setting:
+  - `AWS_BEDROCK_REGION` (optional override; otherwise uses `AWS_REGION`/`AWS_DEFAULT_REGION`)
 - Optional model settings:
   - `OPENAI_AUTHORSHIP_MODEL` (default: `gpt-4.1-mini`)
   - `MODEL_INPUT_CHAR_LIMIT` (default: `12000`)
@@ -165,8 +183,8 @@ Notes:
 - `/document-summary` supports `.pdf` and `.docx`, and returns a downloadable `.pdf` file.
 - `additional_directions` lets users tailor the summary from a textbox in the web UI.
 - Optional document summary model settings:
-  - `OPENAI_DOCUMENT_SUMMARY_MODEL` (fallbacks: `OPENAI_CLINICAL_SUMMARY_MODEL`, then `OPENAI_AUTHORSHIP_MODEL`, then `gpt-4.1-mini`)
-  - `DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT` (per-chunk model input cap; fallback: `CLINICAL_SUMMARY_INPUT_CHAR_LIMIT`, default: `16000`)
+  - `OPENAI_DOCUMENT_SUMMARY_MODEL` (fallback: `OPENAI_AUTHORSHIP_MODEL`, then `gpt-4.1-mini`)
+  - `DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT` (per-chunk model input cap, default: `16000`)
   - `DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT` (summary chunk size; fallback: `CHUNK_CHAR_LIMIT`, default: `4500`)
   - `DOCUMENT_SUMMARY_MAX_CHUNKS` (maximum chunks analyzed, default: `12`)
 - Use it with manual review and document metadata checks.
@@ -179,6 +197,8 @@ Notes:
 sam build --use-container
 sam deploy --guided
 ```
+
+The SAM template includes a shared dependency Lambda Layer (`SharedDependenciesLayer`) built from `layer/requirements.txt` and attached to all pipeline functions.
 
 Or use script:
 

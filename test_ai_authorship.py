@@ -204,6 +204,58 @@ def test_analyze_endpoint_passes_selected_model(tmp_path: Path, monkeypatch: pyt
     assert captured["model_name"] == "gpt-5"
 
 
+def test_analyze_endpoint_accepts_bedrock_model_name(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi.testclient import TestClient
+    import ai_authorship_bot
+
+    captured: dict[str, str | None] = {}
+
+    def _fake_analyze_file_authorship(path: Path, filename: str | None = None, detector: str = "heuristic", model_name: str | None = None):
+        _ = path
+        _ = filename
+        captured["detector"] = detector
+        captured["model_name"] = model_name
+        result = SimpleNamespace(
+            label="inconclusive",
+            ai_probability=0.5,
+            confidence=0.5,
+            summary="mocked",
+            features=SimpleNamespace(
+                word_count=10,
+                sentence_count=2,
+                avg_sentence_length=5.0,
+                sentence_length_stddev=1.0,
+                type_token_ratio=0.7,
+                repeated_bigram_ratio=0.0,
+                stopword_ratio=0.4,
+                punctuation_density=0.05,
+            ),
+        )
+        return result, "mock text"
+
+    monkeypatch.setattr(ai_authorship_bot, "analyze_file_authorship", _fake_analyze_file_authorship)
+
+    pdf_path = tmp_path / "selected-bedrock-model.pdf"
+    _make_pdf(pdf_path, "Text for selected Bedrock model test.")
+
+    selected_model = "bedrock:anthropic.claude-3-7-sonnet-20250219-v1:0"
+    client = TestClient(ai_authorship_bot.app)
+    with pdf_path.open("rb") as handle:
+        response = client.post(
+            "/analyze",
+            data={"detector": "model", "model_name": selected_model},
+            files={"file": ("selected-bedrock-model.pdf", handle, "application/pdf")},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["model_name_requested"] == selected_model
+    assert captured["detector"] == "model"
+    assert captured["model_name"] == selected_model
+
+
 class _FakeComprehendClient:
     def detect_pii_entities(self, Text: str, LanguageCode: str) -> dict:
         entities = []
@@ -514,7 +566,7 @@ def test_document_summary_requires_api_key(tmp_path: Path, monkeypatch: pytest.M
 
 
 def test_document_summary_uses_chunking_pipeline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    import clinical_summary
+    import document_summary
 
     pdf_path = tmp_path / "chunked-summary.pdf"
     _make_pdf(
@@ -538,10 +590,10 @@ def test_document_summary_uses_chunking_pipeline(tmp_path: Path, monkeypatch: py
             "disclaimer": f"Directions={additional_directions or ''}",
         }
 
-    monkeypatch.setattr(clinical_summary, "chunk_text", _fake_chunk_text)
-    monkeypatch.setattr(clinical_summary, "_call_document_summary_model", _fake_call_document_summary_model)
+    monkeypatch.setattr(document_summary, "chunk_text", _fake_chunk_text)
+    monkeypatch.setattr(document_summary, "_call_document_summary_model", _fake_call_document_summary_model)
 
-    output_path, metrics = clinical_summary.generate_document_summary_file(
+    output_path, metrics = document_summary.generate_document_summary_file(
         pdf_path,
         filename="chunked-summary.pdf",
         model_name="gpt-5",
@@ -655,6 +707,144 @@ def test_s3_trigger_path_runs_all_three_capabilities(tmp_path: Path, monkeypatch
     assert outputs["document_summary"]["status"] == "COMPLETED"
     assert ("example-bucket", "reports/sample-authorship-report.json") in uploaded_json
     assert ("example-bucket", "reports/sample-document-summary.pdf") in uploaded_files
+
+
+def test_modular_s3_pipeline_finalizes_all_capabilities(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "test")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "test")
+    import assemble_output
+
+    input_pdf = tmp_path / "incoming-modular.pdf"
+    _make_pdf(input_pdf, "Modular pipeline source text.")
+
+    uploaded_files: dict[tuple[str, str], dict[str, str]] = {}
+    uploaded_json: dict[tuple[str, str], dict] = {}
+
+    class _FakeS3Client:
+        def download_file(self, _bucket: str, _key: str, filename: str) -> None:
+            Path(filename).write_bytes(input_pdf.read_bytes())
+
+        def upload_file(self, filename: str, bucket: str, key: str, ExtraArgs: dict | None = None) -> None:
+            uploaded_files[(bucket, key)] = {
+                "filename": filename,
+                "content_type": (ExtraArgs or {}).get("ContentType", ""),
+            }
+
+    def _fake_upload_json(bucket: str, key: str, payload: dict) -> None:
+        uploaded_json[(bucket, key)] = payload
+
+    def _fake_load_json(bucket: str, key: str) -> dict:
+        return uploaded_json[(bucket, key)]
+
+    def _fake_analyze_file_authorship(
+        _path: Path,
+        filename: str | None = None,
+        detector: str = "heuristic",
+        model_name: str | None = None,
+    ):
+        _ = filename
+        _ = detector
+        _ = model_name
+        result = SimpleNamespace(
+            label="likely_human",
+            ai_probability=0.22,
+            confidence=0.88,
+            summary="Authorship summary.",
+            features=SimpleNamespace(
+                word_count=100,
+                sentence_count=7,
+                avg_sentence_length=14.2,
+                sentence_length_stddev=3.1,
+                type_token_ratio=0.68,
+                repeated_bigram_ratio=0.02,
+                stopword_ratio=0.42,
+                punctuation_density=0.06,
+            ),
+        )
+        return result, "modular extracted text"
+
+    def _fake_generate_document_summary_file(
+        _input_path: Path,
+        *,
+        filename: str,
+        model_name: str | None = None,
+        additional_directions: str | None = None,
+    ):
+        _ = filename
+        _ = model_name
+        _ = additional_directions
+        output_path = tmp_path / "modular-summary.pdf"
+        _make_pdf(output_path, "Modular summary artifact.")
+        return output_path, {
+            "model_name_used": model_name or "gpt-5",
+            "input_characters": 120,
+            "characters_analyzed": 120,
+            "total_chunks": 1,
+            "chunks_analyzed": 1,
+            "chunk_char_limit": 4500,
+            "max_chunks": 12,
+            "key_point_count": 2,
+            "additional_directions_provided": bool(additional_directions),
+            "additional_directions_length": len((additional_directions or "").strip()),
+        }
+
+    monkeypatch.setattr(assemble_output, "s3_client", _FakeS3Client())
+    monkeypatch.setattr(assemble_output, "_upload_json", _fake_upload_json)
+    monkeypatch.setattr(assemble_output, "_load_json", _fake_load_json)
+    monkeypatch.setattr(assemble_output, "_delete_prefix", lambda _bucket, _prefix: 4)
+    monkeypatch.setattr(assemble_output, "analyze_file_authorship", _fake_analyze_file_authorship)
+    monkeypatch.setattr(assemble_output, "generate_document_summary_file", _fake_generate_document_summary_file)
+
+    base_event = {
+        "job_id": "job-modular-123",
+        "input_bucket": "input-bucket",
+        "input_key": "incoming/sample.pdf",
+        "output_bucket": "output-bucket",
+        "work_bucket": "output-bucket",
+        "input_prefix": "incoming/",
+        "report_prefix": "reports/",
+        "work_prefix": "work/",
+        "redacted_pdf_key": "redacted/sample-redacted.pdf",
+        "report_key": "reports/sample-redaction-report.json",
+        "base_report_key": "work/job-modular-123/base-report.json",
+        "changes_made": 18,
+        "effectiveness_score": 97.5,
+        "enable_s3_authorship": True,
+        "enable_s3_document_summary": True,
+        "require_s3_capabilities": True,
+        "s3_authorship_detector": "heuristic",
+        "s3_authorship_model_name": "",
+        "s3_summary_model_name": "gpt-5",
+        "s3_summary_directions": "Highlight decisions.",
+    }
+    uploaded_json[("output-bucket", "work/job-modular-123/base-report.json")] = {
+        "job_id": "job-modular-123",
+        "output": {
+            "bucket": "output-bucket",
+            "redacted_pdf_key": "redacted/sample-redacted.pdf",
+            "report_key": "reports/sample-redaction-report.json",
+        },
+    }
+
+    authorship_output = assemble_output.authorship_artifact_lambda_handler(base_event, None)
+    summary_output = assemble_output.document_summary_artifact_lambda_handler(base_event, None)
+    final_result = assemble_output.finalize_report_lambda_handler(
+        {
+            **base_event,
+            "capability_results": [authorship_output, summary_output],
+        },
+        None,
+    )
+
+    assert final_result["status"] == "COMPLETED"
+    assert final_result["capabilities"]["authorship"]["status"] == "COMPLETED"
+    assert final_result["capabilities"]["document_summary"]["status"] == "COMPLETED"
+    assert final_result["authorship_report_key"] == "reports/sample-authorship-report.json"
+    assert final_result["document_summary_pdf_key"] == "reports/sample-document-summary.pdf"
+    assert ("output-bucket", "reports/sample-authorship-report.json") in uploaded_json
+    assert ("output-bucket", "reports/sample-document-summary.pdf") in uploaded_files
+    assert ("output-bucket", "reports/sample-redaction-report.json") in uploaded_json
 
 
 def test_start_execution_includes_s3_capability_settings(monkeypatch: pytest.MonkeyPatch) -> None:

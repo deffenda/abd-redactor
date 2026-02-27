@@ -15,12 +15,13 @@ from ai_authorship import (
     analyze_file_authorship,
     normalize_detector,
 )
-from clinical_summary import (
+from document_summary import (
     DEFAULT_DOCUMENT_SUMMARY_MODEL,
     SUPPORTED_DOCUMENT_SUMMARY_EXTENSIONS,
     build_document_summary_filename,
     generate_document_summary_file,
 )
+from model_inference import MODEL_DROPDOWN_OPTIONS, SUPPORTED_MODEL_NAMES
 from upload_redaction import (
     REDACTION_ENGINE_COMPREHEND,
     REDACTION_ENGINE_MODEL,
@@ -34,13 +35,12 @@ from upload_redaction import (
 
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024 * 1024)))
 TEXT_PREVIEW_LENGTH = int(os.getenv("TEXT_PREVIEW_LENGTH", "280"))
-MODEL_DROPDOWN_OPTIONS: list[tuple[str, str]] = [
-    ("gpt-4", "GPT-4"),
-    ("gpt-4.1", "GPT-4.1"),
-    ("gpt-5", "GPT-5"),
-    ("gpt-5.2-pro", "GPT-5.2-pro"),
-]
-SUPPORTED_MODEL_NAMES = {model_name for model_name, _ in MODEL_DROPDOWN_OPTIONS}
+# MODEL_DROPDOWN_OPTIONS comes from `model_inference` and intentionally includes:
+# - OpenAI model names
+# - `bedrock:*` identifiers for AWS Bedrock models
+# Keep the API validation list and UI dropdown in sync by editing that single source.
+# GovCloud/NIST deployment tip: if your boundary disallows external providers, expose only
+# `bedrock:*` options in `model_inference.py` and remove OpenAI options from that list.
 
 app = FastAPI(
     title="AI Authorship + Redaction + Document Summary Bot",
@@ -570,7 +570,6 @@ async def redact_document(
 
 
 @app.post("/document-summary")
-@app.post("/clinical-summary")
 async def generate_document_summary(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),

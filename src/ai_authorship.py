@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import fitz  # PyMuPDF
+from model_inference import call_model_text
 
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx"}
@@ -308,17 +309,6 @@ def _extract_json_payload(raw: str) -> dict[str, Any]:
 
 
 def _call_openai_model_detector(text: str, model_name: str) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required when detector='model'.")
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("The 'openai' package is required when detector='model'.") from exc
-
-    client = OpenAI(api_key=api_key)
-
     system_prompt = (
         "You are an AI-authorship analyst. Return JSON only with keys: "
         "ai_probability (0..1 float), confidence (0..1 float), "
@@ -330,68 +320,21 @@ def _call_openai_model_detector(text: str, model_name: str) -> dict[str, Any]:
         f"TEXT:\n{text}"
     )
 
-    request_kwargs = {
-        "model": model_name,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    if not model_name.startswith("gpt-5"):
-        request_kwargs["temperature"] = 0
-
-    def _call_responses_api() -> dict[str, Any]:
-        response = client.responses.create(
-            model=model_name,
-            instructions=system_prompt,
-            input=user_prompt,
-            text={"format": {"type": "json_object"}},
-        )
-        raw = getattr(response, "output_text", "") or ""
-        return _extract_json_payload(raw)
-
-    try:
-        response = client.chat.completions.create(**request_kwargs)
-        raw = response.choices[0].message.content or ""
-        return _extract_json_payload(raw)
-    except Exception as exc:
-        lower_message = str(exc).lower()
-
-        # Some models only allow the default temperature value.
-        if "temperature" in lower_message and "default" in lower_message:
-            try:
-                request_kwargs.pop("temperature", None)
-                response = client.chat.completions.create(**request_kwargs)
-                raw = response.choices[0].message.content or ""
-                return _extract_json_payload(raw)
-            except Exception as retry_exc:
-                raise RuntimeError(f"Model detector request failed: {retry_exc}") from retry_exc
-
-        # Fallback for models that are not available on /v1/chat/completions.
-        if "not a chat model" in lower_message and "chat/completions" in lower_message:
-            try:
-                return _call_responses_api()
-            except Exception:
-                pass
-
-            try:
-                prompt = (
-                    f"{system_prompt}\n\n"
-                    f"{user_prompt}\n\n"
-                    "Return only valid JSON with the required keys."
-                )
-                completion = client.completions.create(
-                    model=model_name,
-                    prompt=prompt,
-                    max_tokens=500,
-                )
-                raw = completion.choices[0].text or ""
-                return _extract_json_payload(raw)
-            except Exception as fallback_exc:
-                raise RuntimeError(f"Model detector request failed: {fallback_exc}") from fallback_exc
-
-        raise RuntimeError(f"Model detector request failed: {exc}") from exc
+    # Provider routing is handled by `call_model_text`:
+    # - OpenAI models -> OPENAI_API_KEY required
+    # - `bedrock:*` models -> AWS credentials + Bedrock model access required
+    # GovCloud/NIST note (SC-7/SA-9): disable external-provider options if your boundary requires
+    # all inference to stay inside AWS-authorized services.
+    raw = call_model_text(
+        model_name=model_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        require_json=True,
+        temperature=0.0,
+        max_tokens=500,
+        error_context="Model detector request",
+    )
+    return _extract_json_payload(raw)
 
 
 def analyze_text_authorship_model(text: str, model_name: str | None = None) -> AuthorshipResult:

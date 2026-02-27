@@ -3,6 +3,11 @@ Transform: AWS::Serverless-2016-10-31
 Description: >-
   Event-driven AWS pipeline to chunk large PDFs, batch-process PII detection
   with Amazon Comprehend, and produce a fully redacted PDF plus redaction report.
+# AWS GovCloud / NIST SP 800-53 implementation notes:
+# - Validate that all services/models used are approved in your ATO boundary.
+# - Typical control mapping for this stack includes AC-2/AC-3/AC-6, AU-2/AU-6/AU-9,
+#   CM-2/CM-6, IA-2/IA-5, SC-7/SC-8/SC-12/SC-13/SC-28, and SI-4/SI-7.
+# - This template is functional baseline infra; apply your agency SSP/ISSO hardening profile.
 
 Globals:
   Function:
@@ -10,6 +15,11 @@ Globals:
     Tracing: Active
     Architectures:
       - x86_64
+    # GovCloud hardening (SC-7): run Lambda in private subnets and route to AWS services
+    # through VPC endpoints (S3, STS, CloudWatch Logs, X-Ray, Step Functions, Comprehend,
+    # and Bedrock Runtime if used). Keep internet egress disabled unless explicitly authorized.
+    Layers:
+      - !Ref SharedDependenciesLayer
 
 Parameters:
   InputPrefix:
@@ -95,9 +105,29 @@ Parameters:
     Type: String
     NoEcho: true
     Default: ""
+    # In production, prefer injecting this from Secrets Manager/SSM rather than plaintext parameter values.
+    # GovCloud boundary note (SC-7/SA-9): OpenAI is an external provider path.
+    # If your boundary disallows external AI APIs, keep this empty and use only `bedrock:*` models.
     Description: Optional OpenAI API key for model-backed S3 capabilities.
 
 Resources:
+  # GovCloud/NIST logging note (AU-11/AU-12):
+  # Add explicit CloudWatch LogGroup resources with retention + KMS encryption for
+  # each Lambda and the Step Functions state machine, rather than relying on defaults.
+  SharedDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub "${AWS::StackName}-shared-dependencies"
+      Description: Shared Python dependencies for PDF processing and model-backed capabilities.
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - x86_64
+      RetentionPolicy: Retain
+    Metadata:
+      BuildMethod: python3.12
+
   PdfPipelineBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -108,6 +138,9 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      # For stricter SC-12/SC-13/SC-28 controls, prefer SSE-KMS with a customer-managed CMK
+      # and key policy scoped to this workload role set.
+      # Consider enabling bucket versioning/object lock per records-retention requirements.
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
@@ -119,10 +152,15 @@ Resources:
     Properties:
       Name: !Sub "${AWS::StackName}-pdf-redaction"
       Type: STANDARD
+      # AU-2/AU-12: Step Functions execution history can be part of auditable evidence.
+      # Configure CloudWatch Logs/X-Ray retention + encryption per your organizational policy.
       DefinitionSubstitutions:
         PrepareChunksFunctionArn: !GetAtt PrepareChunksFunction.Arn
         DetectBatchFunctionArn: !GetAtt DetectBatchFunction.Arn
-        AssembleOutputFunctionArn: !GetAtt AssembleOutputFunction.Arn
+        AssembleRedactionFunctionArn: !GetAtt AssembleRedactionFunction.Arn
+        GenerateAuthorshipArtifactFunctionArn: !GetAtt GenerateAuthorshipArtifactFunction.Arn
+        GenerateDocumentSummaryArtifactFunctionArn: !GetAtt GenerateDocumentSummaryArtifactFunction.Arn
+        FinalizeReportFunctionArn: !GetAtt FinalizeReportFunction.Arn
       Definition:
         Comment: Chunk large PDFs, detect PII in parallel batches, and build redacted outputs.
         StartAt: PrepareChunks
@@ -162,12 +200,45 @@ Resources:
                   OutputPath: $.Payload
                   End: true
             ResultPath: $.batch_results
-            Next: AssembleOutput
-          AssembleOutput:
+            Next: AssembleRedaction
+          AssembleRedaction:
             Type: Task
             Resource: arn:aws:states:::lambda:invoke
             Parameters:
-              FunctionName: ${AssembleOutputFunctionArn}
+              FunctionName: ${AssembleRedactionFunctionArn}
+              Payload.$: $
+            OutputPath: $.Payload
+            Next: GenerateCapabilities
+          GenerateCapabilities:
+            Type: Parallel
+            Branches:
+              - StartAt: GenerateAuthorshipArtifact
+                States:
+                  GenerateAuthorshipArtifact:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Parameters:
+                      FunctionName: ${GenerateAuthorshipArtifactFunctionArn}
+                      Payload.$: $
+                    OutputPath: $.Payload
+                    End: true
+              - StartAt: GenerateDocumentSummaryArtifact
+                States:
+                  GenerateDocumentSummaryArtifact:
+                    Type: Task
+                    Resource: arn:aws:states:::lambda:invoke
+                    Parameters:
+                      FunctionName: ${GenerateDocumentSummaryArtifactFunctionArn}
+                      Payload.$: $
+                    OutputPath: $.Payload
+                    End: true
+            ResultPath: $.capability_results
+            Next: FinalizeReport
+          FinalizeReport:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            Parameters:
+              FunctionName: ${FinalizeReportFunctionArn}
               Payload.$: $
             OutputPath: $.Payload
             End: true
@@ -177,7 +248,15 @@ Resources:
         - LambdaInvokePolicy:
             FunctionName: !Ref DetectBatchFunction
         - LambdaInvokePolicy:
-            FunctionName: !Ref AssembleOutputFunction
+            FunctionName: !Ref AssembleRedactionFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GenerateAuthorshipArtifactFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref GenerateDocumentSummaryArtifactFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref FinalizeReportFunction
+      # AC-6: Revisit this policy set and scope to least privilege when introducing
+      # additional workflow steps or cross-account integrations.
 
   StartPipelineFunction:
     Type: AWS::Serverless::Function
@@ -214,6 +293,7 @@ Resources:
               Action:
                 - states:StartExecution
               Resource: !Ref PdfRedactionStateMachine
+      # AC-6: Keep permission to only this state machine ARN (already scoped).
 
   PrepareChunksFunction:
     Type: AWS::Serverless::Function
@@ -231,6 +311,8 @@ Resources:
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref PdfPipelineBucket
+      # AC-6 note: S3CrudPolicy is broad for rapid setup; replace with prefix-scoped IAM statements
+      # (`incoming/`, `work/`) in regulated deployments.
 
   DetectBatchFunction:
     Type: AWS::Serverless::Function
@@ -253,12 +335,14 @@ Resources:
               Action:
                 - comprehend:DetectPiiEntities
               Resource: "*"
+      # Comprehend DetectPiiEntities currently uses "*" resource scope by API design.
+      # Document this exception in least-privilege reviews (AC-6) and monitor usage (AU-6).
 
-  AssembleOutputFunction:
+  AssembleRedactionFunction:
     Type: AWS::Serverless::Function
     Properties:
       CodeUri: src/
-      Handler: assemble_output.lambda_handler
+      Handler: assemble_redaction.lambda_handler
       Timeout: 900
       MemorySize: 3008
       Environment:
@@ -267,7 +351,6 @@ Resources:
           OUTPUT_PREFIX: !Ref OutputPrefix
           REPORT_PREFIX: !Ref ReportPrefix
           WORK_PREFIX: !Ref WorkPrefix
-          OPENAI_API_KEY: !Ref OpenAIApiKey
           ENABLE_S3_AUTHORSHIP: !Ref EnableS3Authorship
           ENABLE_S3_DOCUMENT_SUMMARY: !Ref EnableS3DocumentSummary
           REQUIRE_S3_CAPABILITIES: !Ref RequireS3Capabilities
@@ -279,6 +362,72 @@ Resources:
       Policies:
         - S3CrudPolicy:
             BucketName: !Ref PdfPipelineBucket
+      # AC-6 note: replace S3CrudPolicy with prefix-scoped permissions in production.
+
+  GenerateAuthorshipArtifactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: generate_authorship_artifact.lambda_handler
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          INPUT_PREFIX: !Ref InputPrefix
+          REPORT_PREFIX: !Ref ReportPrefix
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+          ENABLE_S3_AUTHORSHIP: !Ref EnableS3Authorship
+          REQUIRE_S3_CAPABILITIES: !Ref RequireS3Capabilities
+          S3_AUTHORSHIP_DETECTOR: !Ref S3AuthorshipDetector
+          S3_AUTHORSHIP_MODEL: !Ref S3AuthorshipModel
+          LOG_LEVEL: INFO
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PdfPipelineBucket
+        # NOTE: If S3AuthorshipModel uses `bedrock:*`, add IAM permissions for Bedrock runtime invocation.
+        # Example actions: `bedrock:InvokeModel` (and optionally `bedrock:InvokeModelWithResponseStream`).
+        # GovCloud/NIST note: if using OpenAI models here, treat as external system interconnection.
+
+  GenerateDocumentSummaryArtifactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: generate_document_summary_artifact.lambda_handler
+      Timeout: 900
+      MemorySize: 3008
+      Environment:
+        Variables:
+          INPUT_PREFIX: !Ref InputPrefix
+          REPORT_PREFIX: !Ref ReportPrefix
+          OPENAI_API_KEY: !Ref OpenAIApiKey
+          ENABLE_S3_DOCUMENT_SUMMARY: !Ref EnableS3DocumentSummary
+          REQUIRE_S3_CAPABILITIES: !Ref RequireS3Capabilities
+          S3_SUMMARY_MODEL: !Ref S3SummaryModel
+          S3_SUMMARY_DIRECTIONS: !Ref S3SummaryDirections
+          LOG_LEVEL: INFO
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PdfPipelineBucket
+        # NOTE: If S3SummaryModel uses `bedrock:*`, add IAM permissions for Bedrock runtime invocation.
+        # Example actions: `bedrock:InvokeModel` (and optionally `bedrock:InvokeModelWithResponseStream`).
+        # GovCloud/NIST note: if using OpenAI models here, treat as external system interconnection.
+
+  FinalizeReportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: finalize_report.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          WORK_PREFIX: !Ref WorkPrefix
+          REQUIRE_S3_CAPABILITIES: !Ref RequireS3Capabilities
+          LOG_LEVEL: INFO
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref PdfPipelineBucket
+      # AC-6 note: replace S3CrudPolicy with prefix-scoped permissions in production.
 
   S3ObjectCreatedRule:
     Type: AWS::Events::Rule

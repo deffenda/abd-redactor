@@ -11,12 +11,18 @@ import boto3
 import fitz
 
 from ai_authorship import DETECTOR_MODEL, analyze_file_authorship, normalize_detector
-from clinical_summary import generate_document_summary_file
+from document_summary import generate_document_summary_file
 
 
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(os.getenv("LOG_LEVEL", "INFO").upper())
 
+# AWS-specific clients:
+# - s3_client requires read/write/delete permissions on input/output/work prefixes.
+# - keep at module scope so tests can monkeypatch with stub clients.
+# NIST references:
+# - AC-6 least privilege: scope roles to required bucket prefixes.
+# - AU-9 protection of audit information: protect report/work artifacts from tampering.
 s3_client = boto3.client("s3")
 comprehend_client = boto3.client("comprehend")
 
@@ -63,11 +69,15 @@ def _normalize_prefix(value: str) -> str:
 
 
 def _load_json(bucket: str, key: str) -> dict:
+    # Reads intermediate/final artifacts from S3; in AWS this depends on `s3:GetObject`.
+    # AU-6: this input should come from trusted workflow output prefixes only.
     response = s3_client.get_object(Bucket=bucket, Key=key)
     return json.loads(response["Body"].read())
 
 
 def _upload_json(bucket: str, key: str, payload: dict) -> None:
+    # Writes report artifacts to S3; in AWS this depends on `s3:PutObject`.
+    # SC-28: ensure bucket/object encryption meets your boundary requirement (typically KMS CMK).
     s3_client.put_object(
         Bucket=bucket,
         Key=key,
@@ -189,6 +199,8 @@ def _run_s3_capabilities(
 
 
 def _delete_prefix(bucket: str, prefix: str) -> int:
+    # Cleanup requires `s3:ListBucket` + `s3:DeleteObject` on the work prefix.
+    # MP-6/SI-12: cleanup supports minimizing retained transient sensitive data.
     deleted = 0
     token = None
 
@@ -484,7 +496,34 @@ def _calculate_benchmark_metrics(total_duration: float, total_boxes: int, total_
     }
 
 
-def lambda_handler(event: dict, _context: object) -> dict:
+def _extract_capability_settings(
+    event: dict[str, Any],
+) -> tuple[bool, bool, bool, str, str | None, str | None, str | None]:
+    include_s3_authorship = _as_bool(event.get("enable_s3_authorship"), DEFAULT_ENABLE_S3_AUTHORSHIP)
+    include_s3_document_summary = _as_bool(
+        event.get("enable_s3_document_summary"),
+        DEFAULT_ENABLE_S3_DOCUMENT_SUMMARY,
+    )
+    require_s3_capabilities = _as_bool(
+        event.get("require_s3_capabilities"),
+        DEFAULT_REQUIRE_S3_CAPABILITIES,
+    )
+    s3_authorship_detector = str(event.get("s3_authorship_detector", DEFAULT_S3_AUTHORSHIP_DETECTOR)).strip().lower()
+    s3_authorship_model_name = str(event.get("s3_authorship_model_name", DEFAULT_S3_AUTHORSHIP_MODEL or "")).strip() or None
+    s3_summary_model_name = str(event.get("s3_summary_model_name", DEFAULT_S3_SUMMARY_MODEL or "")).strip() or None
+    s3_summary_directions = str(event.get("s3_summary_directions", DEFAULT_S3_SUMMARY_DIRECTIONS)).strip() or None
+    return (
+        include_s3_authorship,
+        include_s3_document_summary,
+        require_s3_capabilities,
+        s3_authorship_detector,
+        s3_authorship_model_name,
+        s3_summary_model_name,
+        s3_summary_directions,
+    )
+
+
+def assemble_redaction_lambda_handler(event: dict, _context: object) -> dict:
     execution_start = time.time()
     start_time_utc = datetime.now(UTC).isoformat()
     
@@ -500,19 +539,15 @@ def lambda_handler(event: dict, _context: object) -> dict:
     output_prefix = event.get("output_prefix", os.getenv("OUTPUT_PREFIX", "redacted/"))
     report_prefix = event.get("report_prefix", os.getenv("REPORT_PREFIX", "reports/"))
     work_prefix = _normalize_prefix(event.get("work_prefix", os.getenv("WORK_PREFIX", "work/")))
-    include_s3_authorship = _as_bool(event.get("enable_s3_authorship"), DEFAULT_ENABLE_S3_AUTHORSHIP)
-    include_s3_document_summary = _as_bool(
-        event.get("enable_s3_document_summary"),
-        DEFAULT_ENABLE_S3_DOCUMENT_SUMMARY,
-    )
-    require_s3_capabilities = _as_bool(
-        event.get("require_s3_capabilities"),
-        DEFAULT_REQUIRE_S3_CAPABILITIES,
-    )
-    s3_authorship_detector = str(event.get("s3_authorship_detector", DEFAULT_S3_AUTHORSHIP_DETECTOR)).strip().lower()
-    s3_authorship_model_name = str(event.get("s3_authorship_model_name", DEFAULT_S3_AUTHORSHIP_MODEL or "")).strip() or None
-    s3_summary_model_name = str(event.get("s3_summary_model_name", DEFAULT_S3_SUMMARY_MODEL or "")).strip() or None
-    s3_summary_directions = str(event.get("s3_summary_directions", DEFAULT_S3_SUMMARY_DIRECTIONS)).strip() or None
+    (
+        include_s3_authorship,
+        include_s3_document_summary,
+        require_s3_capabilities,
+        s3_authorship_detector,
+        s3_authorship_model_name,
+        s3_summary_model_name,
+        s3_summary_directions,
+    ) = _extract_capability_settings(event)
 
     batch_results = event.get("batch_results", [])
 
@@ -548,37 +583,40 @@ def lambda_handler(event: dict, _context: object) -> dict:
     pages_with_redactions = 0
     time_per_page: dict[int, float] = {}
 
-    with fitz.open(local_input) as document:
-        total_pages_in_doc = len(document)
-        
-        for page in document:
-            page_start = time.time()
-            page_number = page.number + 1
-            phrases = sorted(phrases_by_page.get(page_number, set()), key=len, reverse=True)
-            if not phrases:
-                continue
-
-            page_hits = 0
-            seen_rects: set[tuple[float, float, float, float]] = set()
-
-            for phrase in phrases:
-                for rect in page.search_for(phrase, quads=False):
-                    rect_key = (round(rect.x0, 3), round(rect.y0, 3), round(rect.x1, 3), round(rect.y1, 3))
-                    if rect_key in seen_rects:
-                        continue
-                    seen_rects.add(rect_key)
-                    page.add_redact_annot(rect, fill=(0, 0, 0))
-                    page_hits += 1
-
-            if page_hits:
-                page.apply_redactions()
-                pages_with_redactions += 1
-                total_boxes += page_hits
-                redactions_per_page[str(page_number)] = page_hits
+    try:
+        with fitz.open(local_input) as document:
+            total_pages_in_doc = len(document)
             
-            time_per_page[page_number] = time.time() - page_start
+            for page in document:
+                page_start = time.time()
+                page_number = page.number + 1
+                phrases = sorted(phrases_by_page.get(page_number, set()), key=len, reverse=True)
+                if not phrases:
+                    continue
 
-        document.save(str(local_output), garbage=4, deflate=True, clean=True)
+                page_hits = 0
+                seen_rects: set[tuple[float, float, float, float]] = set()
+
+                for phrase in phrases:
+                    for rect in page.search_for(phrase, quads=False):
+                        rect_key = (round(rect.x0, 3), round(rect.y0, 3), round(rect.x1, 3), round(rect.y1, 3))
+                        if rect_key in seen_rects:
+                            continue
+                        seen_rects.add(rect_key)
+                        page.add_redact_annot(rect, fill=(0, 0, 0))
+                        page_hits += 1
+
+                if page_hits:
+                    page.apply_redactions()
+                    pages_with_redactions += 1
+                    total_boxes += page_hits
+                    redactions_per_page[str(page_number)] = page_hits
+                
+                time_per_page[page_number] = time.time() - page_start
+
+            document.save(str(local_output), garbage=4, deflate=True, clean=True)
+    finally:
+        local_input.unlink(missing_ok=True)
 
     redacted_key = _build_output_key(input_key, input_prefix, output_prefix, "-redacted.pdf")
     report_key = _build_output_key(input_key, input_prefix, report_prefix, "-redaction-report.json")
@@ -588,21 +626,6 @@ def lambda_handler(event: dict, _context: object) -> dict:
         output_bucket,
         redacted_key,
         ExtraArgs={"ContentType": "application/pdf"},
-    )
-
-    capability_outputs = _run_s3_capabilities(
-        local_input=local_input,
-        input_key=input_key,
-        input_prefix=input_prefix,
-        output_bucket=output_bucket,
-        report_prefix=report_prefix,
-        include_authorship=include_s3_authorship,
-        include_document_summary=include_s3_document_summary,
-        require_all_capabilities=require_s3_capabilities,
-        authorship_detector=s3_authorship_detector,
-        authorship_model_name=s3_authorship_model_name,
-        document_summary_model_name=s3_summary_model_name,
-        document_summary_directions=s3_summary_directions,
     )
 
     # Get redacted file size
@@ -722,8 +745,216 @@ def lambda_handler(event: dict, _context: object) -> dict:
             ],
             "audit_readiness": risk_assessment.get("audit_confidence_percent", 0),
         },
-        "capabilities": capability_outputs,
     }
+    base_report_key = f"{work_prefix}{job_id}/base-report.json"
+    _upload_json(work_bucket, base_report_key, report)
+
+    result = {
+        "job_id": job_id,
+        "status": "REDACTION_COMPLETED",
+        "input_bucket": input_bucket,
+        "input_key": input_key,
+        "output_bucket": output_bucket,
+        "work_bucket": work_bucket,
+        "input_prefix": input_prefix,
+        "output_prefix": output_prefix,
+        "report_prefix": report_prefix,
+        "work_prefix": work_prefix,
+        "redacted_pdf_key": redacted_key,
+        "report_key": report_key,
+        "base_report_key": base_report_key,
+        "changes_made": total_boxes,
+        "effectiveness_score": round(effectiveness_score, 2),
+        "enable_s3_authorship": include_s3_authorship,
+        "enable_s3_document_summary": include_s3_document_summary,
+        "require_s3_capabilities": require_s3_capabilities,
+        "s3_authorship_detector": s3_authorship_detector,
+        "s3_authorship_model_name": s3_authorship_model_name,
+        "s3_summary_model_name": s3_summary_model_name,
+        "s3_summary_directions": s3_summary_directions,
+    }
+    local_output.unlink(missing_ok=True)
+    LOGGER.info("Assemble redaction result: %s", json.dumps(result))
+    return result
+
+
+def authorship_artifact_lambda_handler(event: dict, _context: object) -> dict[str, Any]:
+    (
+        include_s3_authorship,
+        _include_s3_document_summary,
+        require_s3_capabilities,
+        s3_authorship_detector,
+        s3_authorship_model_name,
+        _s3_summary_model_name,
+        _s3_summary_directions,
+    ) = _extract_capability_settings(event)
+
+    if not include_s3_authorship:
+        return {"capability": "authorship", "result": {"status": "SKIPPED"}}
+
+    input_bucket = event["input_bucket"]
+    input_key = event["input_key"]
+    output_bucket = event.get("output_bucket") or input_bucket
+    input_prefix = event.get("input_prefix", os.getenv("INPUT_PREFIX", "incoming/"))
+    report_prefix = event.get("report_prefix", os.getenv("REPORT_PREFIX", "reports/"))
+    temp_input = Path(f"/tmp/{event['job_id']}-authorship-input{Path(input_key).suffix or '.pdf'}")
+
+    try:
+        s3_client.download_file(input_bucket, input_key, str(temp_input))
+        selected_detector = normalize_detector(s3_authorship_detector)
+        selected_model = s3_authorship_model_name if selected_detector == DETECTOR_MODEL else None
+        authorship_result, extracted_text = analyze_file_authorship(
+            temp_input,
+            filename=Path(input_key).name,
+            detector=selected_detector,
+            model_name=selected_model,
+        )
+        authorship_report_key = _build_output_key(
+            input_key,
+            input_prefix,
+            report_prefix,
+            "-authorship-report.json",
+        )
+        _upload_json(
+            output_bucket,
+            authorship_report_key,
+            {
+                "input_key": input_key,
+                "detector_used": selected_detector,
+                "model_name_used": selected_model,
+                "label": authorship_result.label,
+                "ai_probability": authorship_result.ai_probability,
+                "confidence": authorship_result.confidence,
+                "summary": authorship_result.summary,
+                "features": authorship_result.features.__dict__,
+                "text_preview": extracted_text[:600],
+                "text_preview_truncated": len(extracted_text) > 600,
+            },
+        )
+        return {
+            "capability": "authorship",
+            "result": {
+                "status": "COMPLETED",
+                "report_key": authorship_report_key,
+                "detector_used": selected_detector,
+                "model_name_used": selected_model,
+                "label": authorship_result.label,
+                "ai_probability": authorship_result.ai_probability,
+            },
+        }
+    except Exception as exc:
+        if require_s3_capabilities:
+            raise
+        return {"capability": "authorship", "result": {"status": "FAILED", "error": str(exc)}}
+    finally:
+        temp_input.unlink(missing_ok=True)
+
+
+def document_summary_artifact_lambda_handler(event: dict, _context: object) -> dict[str, Any]:
+    (
+        _include_s3_authorship,
+        include_s3_document_summary,
+        require_s3_capabilities,
+        _s3_authorship_detector,
+        _s3_authorship_model_name,
+        s3_summary_model_name,
+        s3_summary_directions,
+    ) = _extract_capability_settings(event)
+
+    if not include_s3_document_summary:
+        return {"capability": "document_summary", "result": {"status": "SKIPPED"}}
+
+    input_bucket = event["input_bucket"]
+    input_key = event["input_key"]
+    output_bucket = event.get("output_bucket") or input_bucket
+    input_prefix = event.get("input_prefix", os.getenv("INPUT_PREFIX", "incoming/"))
+    report_prefix = event.get("report_prefix", os.getenv("REPORT_PREFIX", "reports/"))
+    temp_input = Path(f"/tmp/{event['job_id']}-summary-input{Path(input_key).suffix or '.pdf'}")
+    summary_output_path: Path | None = None
+
+    try:
+        s3_client.download_file(input_bucket, input_key, str(temp_input))
+        summary_output_path, summary_metrics = generate_document_summary_file(
+            temp_input,
+            filename=Path(input_key).name,
+            model_name=s3_summary_model_name,
+            additional_directions=s3_summary_directions,
+        )
+        summary_pdf_key = _build_output_key(
+            input_key,
+            input_prefix,
+            report_prefix,
+            "-document-summary.pdf",
+        )
+        s3_client.upload_file(
+            str(summary_output_path),
+            output_bucket,
+            summary_pdf_key,
+            ExtraArgs={"ContentType": "application/pdf"},
+        )
+        return {
+            "capability": "document_summary",
+            "result": {
+                "status": "COMPLETED",
+                "summary_pdf_key": summary_pdf_key,
+                **summary_metrics,
+            },
+        }
+    except Exception as exc:
+        if require_s3_capabilities:
+            raise
+        return {"capability": "document_summary", "result": {"status": "FAILED", "error": str(exc)}}
+    finally:
+        temp_input.unlink(missing_ok=True)
+        if summary_output_path and summary_output_path.exists():
+            summary_output_path.unlink(missing_ok=True)
+
+
+def _collect_capability_outputs(capability_results: Any) -> dict[str, Any]:
+    outputs: dict[str, Any] = {
+        "authorship": {"status": "SKIPPED"},
+        "document_summary": {"status": "SKIPPED"},
+    }
+    if not isinstance(capability_results, list):
+        return outputs
+    for item in capability_results:
+        if not isinstance(item, dict):
+            continue
+        capability = str(item.get("capability", "")).strip().lower()
+        result = item.get("result")
+        if capability in outputs and isinstance(result, dict):
+            outputs[capability] = result
+    return outputs
+
+
+def finalize_report_lambda_handler(event: dict, _context: object) -> dict[str, Any]:
+    LOGGER.info("Finalizing output report for event: %s", json.dumps(event))
+    job_id = event["job_id"]
+    input_bucket = event["input_bucket"]
+    output_bucket = event.get("output_bucket") or input_bucket
+    work_bucket = event.get("work_bucket") or output_bucket
+    report_key = event["report_key"]
+    base_report_key = event.get("base_report_key")
+    work_prefix = _normalize_prefix(event.get("work_prefix", os.getenv("WORK_PREFIX", "work/")))
+    require_s3_capabilities = _as_bool(
+        event.get("require_s3_capabilities"),
+        DEFAULT_REQUIRE_S3_CAPABILITIES,
+    )
+
+    capability_outputs = _collect_capability_outputs(event.get("capability_results"))
+    failed_capabilities = [
+        name
+        for name, output in capability_outputs.items()
+        if isinstance(output, dict) and output.get("status") == "FAILED"
+    ]
+    if require_s3_capabilities and failed_capabilities:
+        raise RuntimeError(f"Required capabilities failed: {', '.join(sorted(failed_capabilities))}")
+
+    if not base_report_key:
+        raise RuntimeError("base_report_key is required for final report assembly.")
+
+    report = _load_json(work_bucket, base_report_key)
+    report["capabilities"] = capability_outputs
 
     authorship_output = capability_outputs.get("authorship", {})
     if authorship_output.get("status") == "COMPLETED":
@@ -733,23 +964,34 @@ def lambda_handler(event: dict, _context: object) -> dict:
         report["output"]["document_summary_pdf_key"] = summary_output.get("summary_pdf_key")
 
     _upload_json(output_bucket, report_key, report)
-
     cleanup_deleted = _delete_prefix(work_bucket, f"{work_prefix}{job_id}/")
 
-    result = {
+    result: dict[str, Any] = {
         "job_id": job_id,
         "status": "COMPLETED",
         "output_bucket": output_bucket,
-        "redacted_pdf_key": redacted_key,
+        "redacted_pdf_key": event["redacted_pdf_key"],
         "report_key": report_key,
-        "changes_made": total_boxes,
-        "effectiveness_score": round(effectiveness_score, 2),
+        "changes_made": int(event.get("changes_made", 0)),
+        "effectiveness_score": float(event.get("effectiveness_score", 0.0)),
         "work_objects_deleted": cleanup_deleted,
         "capabilities": capability_outputs,
     }
-    if capability_outputs.get("authorship", {}).get("status") == "COMPLETED":
-        result["authorship_report_key"] = capability_outputs["authorship"].get("report_key")
-    if capability_outputs.get("document_summary", {}).get("status") == "COMPLETED":
-        result["document_summary_pdf_key"] = capability_outputs["document_summary"].get("summary_pdf_key")
-    LOGGER.info("Assemble result: %s", json.dumps(result))
+    if authorship_output.get("status") == "COMPLETED":
+        result["authorship_report_key"] = authorship_output.get("report_key")
+    if summary_output.get("status") == "COMPLETED":
+        result["document_summary_pdf_key"] = summary_output.get("summary_pdf_key")
+    LOGGER.info("Finalize result: %s", json.dumps(result))
     return result
+
+
+def lambda_handler(event: dict, context: object) -> dict[str, Any]:
+    """Backward-compatible monolithic handler that composes the modular steps."""
+    assembled = assemble_redaction_lambda_handler(event, context)
+    capability_results = [
+        authorship_artifact_lambda_handler(assembled, context),
+        document_summary_artifact_lambda_handler(assembled, context),
+    ]
+    assembled_with_capabilities = dict(assembled)
+    assembled_with_capabilities["capability_results"] = capability_results
+    return finalize_report_lambda_handler(assembled_with_capabilities, context)

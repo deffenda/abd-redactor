@@ -9,6 +9,7 @@ import boto3
 import fitz  # PyMuPDF
 
 from detect_pii_settings import COMPREHEND_LANGUAGE, MIN_ENTITY_SCORE
+from model_inference import call_model_text
 from prepare_chunks import chunk_text
 
 
@@ -21,6 +22,9 @@ DEFAULT_CHUNK_CHAR_LIMIT = int(os.getenv("CHUNK_CHAR_LIMIT", "4500"))
 DEFAULT_REDACTION_MODEL = os.getenv("OPENAI_REDACTION_MODEL", os.getenv("OPENAI_AUTHORSHIP_MODEL", "gpt-4.1"))
 MODEL_REDACTION_INPUT_CHAR_LIMIT = int(os.getenv("MODEL_REDACTION_INPUT_CHAR_LIMIT", "9000"))
 
+# AWS-specific: this client requires valid AWS credentials and `comprehend:DetectPiiEntities`.
+# Keep this as a module-level symbol so tests can monkeypatch it with a fake/stub client.
+# GovCloud/NIST note: prefer IAM role credentials (IA-2/IA-5), and monitor API usage via CloudTrail/AU controls.
 comprehend_client = boto3.client("comprehend")
 
 
@@ -67,7 +71,7 @@ def _extract_json_payload(raw: str) -> dict[str, Any]:
     return payload
 
 
-def _call_model_redaction_detector(client: object, text: str, model_name: str) -> list[dict]:
+def _call_model_redaction_detector(text: str, model_name: str) -> list[dict]:
     system_prompt = (
         "You are a PII extraction assistant for redaction. "
         "Return JSON only with key 'findings' that is a list of objects. "
@@ -84,33 +88,16 @@ def _call_model_redaction_detector(client: object, text: str, model_name: str) -
 
     payload: dict[str, Any]
 
-    try:
-        response = client.responses.create(
-            model=model_name,
-            instructions=system_prompt,
-            input=user_prompt,
-            text={"format": {"type": "json_object"}},
-        )
-        raw = getattr(response, "output_text", "") or ""
-        payload = _extract_json_payload(raw)
-    except Exception:
-        request_kwargs = {
-            "model": model_name,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        if not model_name.startswith("gpt-5"):
-            request_kwargs["temperature"] = 0
-
-        try:
-            response = client.chat.completions.create(**request_kwargs)
-            raw = response.choices[0].message.content or ""
-            payload = _extract_json_payload(raw)
-        except Exception as chat_exc:
-            raise RuntimeError(f"Model redaction request failed: {chat_exc}") from chat_exc
+    raw = call_model_text(
+        model_name=model_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        require_json=True,
+        temperature=0.0,
+        max_tokens=1200,
+        error_context="Model redaction request",
+    )
+    payload = _extract_json_payload(raw)
 
     findings_raw = payload.get("findings", [])
     if not isinstance(findings_raw, list):
@@ -139,6 +126,9 @@ def _extract_findings_from_pdf_comprehend(
     min_entity_score: float,
     language_code: str,
 ) -> list[dict]:
+    # This path executes live calls to Amazon Comprehend for each text chunk.
+    # For local unit tests/offline runs, patch `comprehend_client` with a stub.
+    # SI-4/AU-6: consider telemetry around chunk counts/error rates for detection monitoring.
     findings: list[dict] = []
     seen: set[tuple[int, str, str]] = set()
 
@@ -195,18 +185,12 @@ def _extract_findings_from_pdf_model(
     min_entity_score: float,
     model_name: str | None,
 ) -> tuple[list[dict], str]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required when redaction_engine='model'.")
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("The 'openai' package is required when redaction_engine='model'.") from exc
-
     effective_model = (model_name or DEFAULT_REDACTION_MODEL).strip() or DEFAULT_REDACTION_MODEL
-    client = OpenAI(api_key=api_key)
 
+    # `call_model_text` routes by model name:
+    # - OpenAI models require OPENAI_API_KEY
+    # - `bedrock:*` models require AWS Bedrock access + IAM permissions
+    # SC-7/SA-9: external-provider model routes may require explicit boundary authorization.
     findings: list[dict] = []
     seen: set[tuple[int, str, str]] = set()
 
@@ -221,7 +205,7 @@ def _extract_findings_from_pdf_model(
                     continue
 
                 model_chunk = chunk[:MODEL_REDACTION_INPUT_CHAR_LIMIT]
-                model_findings = _call_model_redaction_detector(client, model_chunk, effective_model)
+                model_findings = _call_model_redaction_detector(model_chunk, effective_model)
                 chunk_lower = model_chunk.lower()
 
                 for finding in model_findings:

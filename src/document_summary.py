@@ -8,6 +8,7 @@ from typing import Any
 import fitz  # PyMuPDF
 
 from ai_authorship import DEFAULT_OPENAI_MODEL, SUPPORTED_EXTENSIONS, extract_text_from_file, normalize_text
+from model_inference import call_model_text
 from prepare_chunks import chunk_text
 
 
@@ -26,11 +27,11 @@ def _read_env_int(name: str, default: int) -> int:
 
 DEFAULT_DOCUMENT_SUMMARY_MODEL = os.getenv(
     "OPENAI_DOCUMENT_SUMMARY_MODEL",
-    os.getenv("OPENAI_CLINICAL_SUMMARY_MODEL", os.getenv("OPENAI_AUTHORSHIP_MODEL", DEFAULT_OPENAI_MODEL)),
+    os.getenv("OPENAI_AUTHORSHIP_MODEL", DEFAULT_OPENAI_MODEL),
 )
 DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT = _read_env_int(
     "DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT",
-    _read_env_int("CLINICAL_SUMMARY_INPUT_CHAR_LIMIT", 16000),
+    16000,
 )
 DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT = _read_env_int(
     "DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT",
@@ -80,17 +81,6 @@ def _string_value(value: Any, default: str = "Not provided") -> str:
 
 
 def _call_document_summary_model(text: str, model_name: str, additional_directions: str | None = None) -> dict[str, Any]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required for document summary generation.")
-
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("The 'openai' package is required for document summary generation.") from exc
-
-    client = OpenAI(api_key=api_key)
-
     system_prompt = (
         "You are a document summarization assistant. Use only evidence explicitly present in the source text. "
         "Do not invent facts. Return JSON only with keys: "
@@ -111,66 +101,20 @@ def _call_document_summary_model(text: str, model_name: str, additional_directio
     user_prompt_parts.append(text)
     user_prompt = "\n".join(user_prompt_parts)
 
-    errors: list[str] = []
-
-    try:
-        response = client.responses.create(
-            model=model_name,
-            instructions=system_prompt,
-            input=user_prompt,
-            text={"format": {"type": "json_object"}},
-        )
-        raw = getattr(response, "output_text", "") or ""
-        return _extract_json_payload(raw)
-    except Exception as exc:
-        errors.append(f"responses API failed: {exc}")
-
-    request_kwargs = {
-        "model": model_name,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    if not model_name.startswith("gpt-5"):
-        request_kwargs["temperature"] = 0
-
-    try:
-        response = client.chat.completions.create(**request_kwargs)
-        raw = response.choices[0].message.content or ""
-        return _extract_json_payload(raw)
-    except Exception as exc:
-        lower_message = str(exc).lower()
-        errors.append(f"chat API failed: {exc}")
-
-        if "temperature" in lower_message and "default" in lower_message:
-            try:
-                request_kwargs.pop("temperature", None)
-                response = client.chat.completions.create(**request_kwargs)
-                raw = response.choices[0].message.content or ""
-                return _extract_json_payload(raw)
-            except Exception as retry_exc:
-                errors.append(f"chat retry failed: {retry_exc}")
-
-        if "not a chat model" in lower_message and "chat/completions" in lower_message:
-            try:
-                completion = client.completions.create(
-                    model=model_name,
-                    prompt=(
-                        f"{system_prompt}\n\n"
-                        f"{user_prompt}\n\n"
-                        "Return only valid JSON with the required keys."
-                    ),
-                    max_tokens=1200,
-                )
-                raw = completion.choices[0].text or ""
-                return _extract_json_payload(raw)
-            except Exception as fallback_exc:
-                errors.append(f"completions fallback failed: {fallback_exc}")
-
-    combined = " | ".join(errors) if errors else "unknown error"
-    raise RuntimeError(f"Document summary model request failed: {combined}")
+    # Provider routing is handled by `call_model_text`:
+    # - OpenAI models require OPENAI_API_KEY
+    # - `bedrock:*` models require AWS credentials + Bedrock access in-region
+    # GovCloud/NIST note (SC-7/SA-9): external-provider usage may be disallowed in some enclaves.
+    raw = call_model_text(
+        model_name=model_name,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        require_json=True,
+        temperature=0.0,
+        max_tokens=1200,
+        error_context="Document summary model request",
+    )
+    return _extract_json_payload(raw)
 
 
 def _format_section(lines: list[str], title: str, values: list[str], empty_text: str = "Not identified.") -> None:
@@ -387,29 +331,3 @@ def generate_document_summary_file(
         "additional_directions_length": len(directions),
     }
     return output_path, metrics
-
-
-# Backward-compatibility aliases for existing imports/routes.
-SUPPORTED_CLINICAL_SUMMARY_EXTENSIONS = SUPPORTED_DOCUMENT_SUMMARY_EXTENSIONS
-DEFAULT_CLINICAL_SUMMARY_MODEL = DEFAULT_DOCUMENT_SUMMARY_MODEL
-CLINICAL_SUMMARY_INPUT_CHAR_LIMIT = DOCUMENT_SUMMARY_INPUT_CHAR_LIMIT
-CLINICAL_SUMMARY_CHUNK_CHAR_LIMIT = DOCUMENT_SUMMARY_CHUNK_CHAR_LIMIT
-CLINICAL_SUMMARY_MAX_CHUNKS = DOCUMENT_SUMMARY_MAX_CHUNKS
-
-
-def build_clinical_summary_filename(filename: str) -> str:
-    return build_document_summary_filename(filename)
-
-
-def generate_clinical_summary_file(
-    input_path: Path,
-    *,
-    filename: str,
-    model_name: str | None = None,
-) -> tuple[Path, dict[str, Any]]:
-    return generate_document_summary_file(
-        input_path,
-        filename=filename,
-        model_name=model_name,
-        additional_directions=None,
-    )
